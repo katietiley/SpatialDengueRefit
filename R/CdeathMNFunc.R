@@ -19,7 +19,7 @@
 
 Cdeath.MN.func <- function(mos_Es, probs){
   # probability of dying dure to vector control doesn't depend on how old a mosquito is
-  if(class(mos_Es) == "matrix"){
+  if(inherits(mos_Es, "matrix")){
     probs = matrix(rep(probs, nrow(mos_Es)), ncol = ncol(mos_Es), byrow = T)
   }
   newmosD2 = rep(0, length(mos_Es))
@@ -28,7 +28,7 @@ Cdeath.MN.func <- function(mos_Es, probs){
     newmosD2[pindex] = apply(cbind(mos_Es[pindex], probs[pindex]), 
                              1, function(u) sum(rbinom(u[1], 1, u[2])))
   }
-  if(class(mos_Es) == "matrix"){
+  if(inherits(mos_Es, "matrix")){
     return(matrix(newmosD2, ncol = ncol(mos_Es)))
   }else{return(newmosD2)}
 }
