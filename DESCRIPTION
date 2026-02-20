@@ -1,4 +1,4 @@
-Package: SpatialDengue
+Package: SpatialDengueRefit
 Title: Fits and simulates a spatial model of the vector-borne disease dengue
 Version: 0.0.0.9000
 Authors@R: person("Oliver", "Brady",, email = "oliver.brady@lshtm.ac.uk", c("aut", "cre"))
