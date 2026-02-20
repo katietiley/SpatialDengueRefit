@@ -20,12 +20,12 @@
 
 
 plot.state <- function(state, examras, unipix, main = NULL){
-  # it state is a matrix collapse into a vector
+  # if state is a matrix collapse into a vector
   if(class(state) == "matrix"){
     state = apply(state, 2, sum)
   }
   examras2 = as.vector(examras)
   examras2[unipix$pixID] = state
-  values(examras) = examras2
-  plot(examras, main = main)
+  raster::values(examras) = examras2
+  raster::plot(examras, main = main)
 }
