@@ -1,0 +1,2636 @@
+---
+title: "Refitting SpatialDengueRefit to Rio de Janeiro dengue data"
+author: "K Tiley"
+date: "`r Sys.Date()`"
+  output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+  pdf_document:
+    toc: true
+---
+
+# Aim
+
+This workflow refits the SpatialDengueRefit patch-based dengue model to Rio de Janeiro public dengue case data. The case data are spatially aggregated to 500 × 500 m grid cells and temporally aggregated by month. The model simulates daily and simulated detected cases are aggregated to calendar months, so the temporal resolution of the raw data can be used directly. The refit compares three human movement models—exponential, gravity, and radiation—using the same ABC-SMC workflow and selects the movement kernel with the lowest final-round discrepancy.
+
+
+# Overview
+
+This workflow follows several steps:
+
+1. Data preparation and model inputs
+  a. Build spatial population surface
+  b. Prepare dengue case data
+  c. Construct patch-based dataset
+  d. Construct immunity landscape
+
+2. Model specification
+  a. Define prior distributions
+  b. Define observed summary statistics
+  c. Simulator wrapper
+  d. Manual simulator check
+
+3. Parameter inference (SMC ABC fitting)
+  -> Which model and parameters fit best?
+  a. Define distance function and fitting criteria (defining "good fit")
+  b. Stochastic evaluation of parameter sets (median of 10 simulations)
+  c. Sequential Monte Carlo algorithm (proposal / perturbation, one SMC round, three-round workflow)
+  d. Movement model comparison and selection
+
+4. Model diagnostics and convergence checks
+  -> Did the fitting process behave properly?
+  a. Simulation diagnostics
+  b. Convergence across SMC rounds
+  c. Parameter learning (posterior vs sampled parameter space)
+
+5. Required outputs & pdetec estimation
+  -> How to translate fitted particles into usable outputs?
+  a. Produce dataframe of final weights (corresponding to finalWeights.rda required for DEN.spatial)
+  b. Posthoc estimation of detection probability (pdetec)
+  c. Parameter histograms across rounds (corresponding to Fig4 from Brady CATI paper)
+  d. Lagged spatial spread validation (analogous to Fig5 from Brady CATI paper)
+
+6. Model validation
+  -> Does the chosen model reproduce reality?
+  a. Spatiotemporal fit validation
+  b. Epidemic time series validation
+  c. Other validation metrics:
+      - temporal vs spatial error structure
+      - posterior predictive coverage
+      - distribution of fit distances across SMC rounds
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 8,
+  fig.height = 5
+)
+
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(sp)
+library(raster)
+library(sf)
+library(geosphere)
+library(ggplot2)
+library(mgcv)
+library(parallel)
+library(devtools)
+library(progressr)
+handlers("txtprogressbar")
+```
+
+## Load local package functions
+
+This project is organised like a package, so we load reusable functions from the repo before running the analysis.
+
+```{r load local package functions}
+getwd() # check in SpatialDengueRefit
+devtools::load_all()
+```
+
+#  Step 1. a. Build spatial population surface
+
+We start from Wolbachia deployment cell data, keep the relevant project cells, and convert one slice of those point-based population values into a raster. The raster is reprojected into longitude/latitude because later distance calculations use geodesic coordinates.
+
+```{r population_data}
+# Rio wmel deployment data
+data(wmel_rio)
+wmel_rio_deployment <- wmel_rio[wmel_rio$In.project == TRUE,]
+wmel_rio_deployment <- wmel_rio_deployment[wmel_rio_deployment$timepoint >= 92,]  # deployment period only; population is constant, so any slice works
+
+# population value per cell doesn't change over time so can take one slice
+rio_pop_pts <- wmel_rio_deployment %>%
+  group_by(cell.id) %>%
+  slice(1) %>%
+  ungroup()
+
+# build raster directly from point grid
+riopop_utm <- rasterFromXYZ(
+  rio_pop_pts[, c("x", "y", "Population")],
+  crs = CRS("+proj=utm +zone=23 +south +datum=WGS84 +units=m +no_defs")
+)
+names(riopop_utm) <- "Population"
+
+# transform because geosphere::distm() requires lat lon instead of utm
+riopop <- projectRaster(
+  riopop_utm,
+  crs = CRS("+proj=longlat +datum=WGS84 +no_defs"),
+  method = "bilinear"
+)
+save(riopop, file = "data/riopop_rio.rda") #save to rda file
+
+# check looks as expected
+plot(riopop)
+```
+
+
+#  Step 1.  b. Prepare dengue case data
+
+#### Select the fitting year
+
+The fitting window was defined as a one-year outbreak period from 1 November 2011 to 31 October 2012. This window captures a single large epidemic wave - the largest pre-Wolbachia season (14,790 cases), with the preceding year (4,794) used for the immunity landscape.
+
+```{r select_outbreak_year, warning=FALSE}
+# keep rows with valid onset date
+deng_clean_all <- wmel_rio %>%
+  filter(!is.na(date))
+
+# define monthly counts across all available data
+monthly_ts <- deng_clean_all %>%
+  mutate(month_start = floor_date(date, unit = "month")) %>%
+  group_by(month_start) %>%
+  summarise(cases = sum(dengue_cases, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(month_start)
+
+# selected outbreak period
+start_date_fit <- as.Date("2011-11-01")
+end_date_fit   <- start_date_fit %m+% years(1) - days(1) # one-year simulation window
+
+# period for sero landscape
+start_date_pre <- start_date_fit %m-% years(1)
+end_date_pre   <- end_date_fit %m-% years(1)
+
+# plot full epidemic curve and mark selected fit window
+ggplot(monthly_ts, aes(x = month_start, y = cases)) +
+  geom_line() +
+  geom_vline(xintercept = as.numeric(start_date_fit), linetype = "dashed") +
+  geom_vline(xintercept = as.numeric(end_date_fit), linetype = "dashed") +
+  coord_cartesian(xlim = as.Date(c("2010-01-01", "2014-01-01"))) +
+  labs(
+    x = "Month",
+    y = "Cases (monthly)",
+    title = "Monthly dengue cases over time",
+    subtitle = "Dashed lines mark the selected fitting window"
+  ) +
+  theme_minimal()
+```
+
+#  Step 1.   c. Construct patch-based dataset
+
+The raster cells become model patches. We then compute distances between patches and assign each observed case to a patch.
+
+```{r patch_agg_checks, warning=FALSE}
+
+# ------------------------------------------------------------
+# 1. Define patch universe: cells that are ever in project
+# ------------------------------------------------------------
+
+project_cell_ids <- wmel_rio %>%
+  group_by(cell.id) %>%
+  summarise(
+    ever_in_project = any(In.project == TRUE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(ever_in_project) %>%
+  pull(cell.id)
+
+# ------------------------------------------------------------
+# 2. Build patch lookup directly from wmel_rio cell.id
+# ------------------------------------------------------------
+
+cell_patch_map <- wmel_rio %>%
+  filter(cell.id %in% project_cell_ids) %>%
+  group_by(cell.id) %>%
+  arrange(date) %>%
+  slice(1) %>%
+  ungroup() %>%
+  arrange(cell.id) %>%
+  mutate(patchID = row_number()) %>%   # IMPORTANT: must have contiguous 1:n for unipix to work in model
+  st_as_sf(
+    coords = c("x", "y"),
+    crs = "+proj=utm +zone=23 +south +datum=WGS84 +units=m +no_defs",
+    remove = FALSE
+  ) %>%
+  st_transform(4326)
+
+lonlat <- st_coordinates(cell_patch_map)
+
+cell_patch_map <- cell_patch_map %>%
+  st_drop_geometry() %>%
+  mutate(
+    Longitude = lonlat[, 1],
+    Latitude  = lonlat[, 2]
+  ) %>%
+  dplyr::select(
+    cell.id,
+    patchID,
+    x_utm = x,
+    y_utm = y,
+    Longitude,
+    Latitude,
+    pop = Population
+  )
+
+# ------------------------------------------------------------
+# 3. Make unipix from cell.id, not from projected raster indexing
+# ------------------------------------------------------------
+
+unipix <- cell_patch_map %>%
+  transmute(
+    patchID = patchID,
+    pixID = cell.id,
+    pop = pop,
+    x = Longitude,
+    y = Latitude
+  ) %>%
+  arrange(patchID) %>%
+  as.data.frame()
+save(unipix, file = "data/unipix_rio.rda") #save to rda file
+
+# ------------------------------------------------------------
+# 4. Create patch-monthly data using exact cell.id matching
+# ------------------------------------------------------------
+
+make_riodat_patchmonthly <- function(dat, start_date, end_date) {
+
+  dat %>%
+    filter(
+      cell.id %in% cell_patch_map$cell.id,
+      !is.na(date),
+      date >= floor_date(start_date, "month"),
+      date <= floor_date(end_date, "month")
+    ) %>%
+    left_join(
+      cell_patch_map %>%
+        dplyr::select(cell.id, patchID, Longitude, Latitude, pop),
+      by = "cell.id"
+    ) %>%
+    mutate(
+      Date = as.Date(date),
+      Month = floor_date(Date, unit = "month"),
+      Number_of_cases = dengue_cases
+    ) %>%
+    group_by(patchID, Date, Month, Longitude, Latitude, pop) %>%
+    summarise(
+      Number_of_cases = sum(Number_of_cases, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(Date, patchID)
+}
+
+riodat_patchmonthly <- make_riodat_patchmonthly(
+  dat = wmel_rio,
+  start_date = start_date_fit,
+  end_date = end_date_fit
+)
+
+riodat_patchmonthly_pre <- make_riodat_patchmonthly(
+  dat = wmel_rio,
+  start_date = start_date_pre,
+  end_date = end_date_pre
+)
+
+```
+
+
+```{r calendar_and_seed, warning=FALSE}
+
+# ---- Simulation calendar: model runs daily; data are monthly ----
+fit_days     <- seq(start_date_fit, end_date_fit, by = "day")   # 366 days (2012 leap year)
+n_days       <- length(fit_days)
+month_levels <- sort(unique(floor_date(fit_days, "month")))
+day_month    <- match(floor_date(fit_days, "month"), month_levels)  # day -> month 1..12
+n_months     <- length(month_levels)
+save(fit_days, day_month, n_days, file = "data/sim_calendar_rio.rda")
+
+# ---- Observed monthly patch counts (real, untransformed) ----
+obs_monthly_patch <- riodat_patchmonthly %>%
+  dplyr::mutate(month_index = match(Month, month_levels)) %>%
+  dplyr::group_by(patchID, month_index) %>%
+  dplyr::summarise(Number_of_cases = sum(Number_of_cases), .groups = "drop")
+stopifnot(sum(obs_monthly_patch$Number_of_cases) == 14790)
+
+# ---- Initial conditions: infectious at day 1, from November 2011 patch counts ----
+# DEN.spatial() treats the first time step's cases as currently infectious.
+# A month of reports is ~4x the number infectious on any one day, so we scale
+# November's counts to one reporting week (seed_fraction = 1 uses all of them).
+seed_fraction <- 7 / lubridate::days_in_month(month_levels[1])
+seed_month <- obs_monthly_patch %>% dplyr::filter(month_index == 1)
+exact  <- seed_month$Number_of_cases * seed_fraction
+target <- round(sum(exact))
+base   <- floor(exact)
+extra  <- target - sum(base)                      # largest-remainder rounding
+if (extra > 0) {
+  idx <- order(exact - base, decreasing = TRUE)[seq_len(extra)]
+  base[idx] <- base[idx] + 1
+}
+fitdat <- data.frame(patchID = seed_month$patchID, Week = 1L,
+                     Number_of_cases = as.integer(base)) %>%
+  dplyr::filter(Number_of_cases > 0)
+timestep <- c(1L, n_months)   # first and last time steps of the data (months)
+save(fitdat,    file = "data/fitdat_rio.rda")
+save(timestep, file = "data/timestep_rio.rda")
+
+# pastdat is not used by DEN.spatial() when stim is supplied; kept for completeness
+pastdat <- riodat_patchmonthly_pre
+save(pastdat, file = "data/pastdat_rio.rda")
+
+```
+
+The patch construction produced 324 model patches. Dengue counts were retained at their reported monthly resolution: 14,790 cases in the fitting year (November 2011–October 2012) and 4,794 in the preceding year. The model simulates daily, and simulated cases are aggregated to calendar months for comparison with these data. Initial infections were taken from November 2011 patch counts, scaled to one reporting week.
+
+### Dengue season totals in the model area
+
+Total reported cases in the model patches for each November–October season, demonstrate fitting year was the largest pre-Wolbachia season. Data start in January 2010 and end in September 2019, so the first and last seasons are incomplete.
+
+```{r season_totals}
+season_totals <- wmel_rio %>%
+  filter(cell.id %in% project_cell_ids, !is.na(date)) %>%
+  mutate(season_start = year(date %m-% months(10))) %>%   # Nov–Oct seasons
+  group_by(season = paste0(season_start, "–", substr(season_start + 1, 3, 4))) %>%
+  summarise(cases = sum(dengue_cases, na.rm = TRUE),
+            first_month = min(floor_date(date, "month")),
+            last_month  = max(floor_date(date, "month")),
+            .groups = "drop")
+
+season_totals
+stopifnot(season_totals$cases[season_totals$season == "2011–12"] == 14790)
+```
+
+#### Plot outbreak year map
+
+```{r patch_agg_checks_outbreak, fig.width=12, fig.height=4, warning=FALSE}
+# aggregate by patch and add patch lon lat
+riodat_year <- riodat_patchmonthly %>%
+  group_by(patchID) %>%
+  summarise(
+    Number_of_cases = sum(Number_of_cases, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    unipix %>% dplyr::select(patchID, x, y),
+    by = "patchID"
+  )
+
+# plot
+ggplot(
+  riodat_year,
+  aes(x = x, y = y, fill = Number_of_cases)
+) +
+  geom_tile(
+    width = 0.005,
+    height = 0.005
+  ) +
+  coord_equal() +
+  scale_fill_gradient(
+    low = "grey95",
+    high = "darkred",
+    name = "Cases",
+    na.value = "transparent"
+  ) +
+  labs(
+    title = "Dengue cases by patch Nov 2011-Oct 2012 (fitting year)",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal()
+
+```
+
+#### Plot previous year map
+
+```{r patch_agg_checks_pre, fig.width=12, fig.height=4, warning=FALSE}
+# aggregate by patch and add patch lon lat
+pastdat_year <- riodat_patchmonthly_pre %>%
+  group_by(patchID) %>%
+  summarise(
+    Number_of_cases = sum(Number_of_cases, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    unipix %>% dplyr::select(patchID, x, y),
+    by = "patchID"
+  )
+
+# plot
+ggplot(
+  pastdat_year,
+  aes(x = x, y = y, fill = Number_of_cases)
+) +
+  geom_tile(
+    width = 0.005,
+    height = 0.005
+  ) +
+  coord_equal() +
+  scale_fill_gradient(
+    low = "grey95",
+    high = "darkred",
+    name = "Cases",
+    na.value = "transparent"
+  ) +
+  labs(
+    title = "Dengue cases by patch Nov 2010-Oct 2011 (preceeding year)",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal()
+
+```
+
+
+#  Step 1.    d. Construct immunity landscape
+
+The prior immunity landscape was derived from the previous year’s patch-level dengue incidence, scaled to a bounded immunity range. This provides a spatially varying proxy for baseline immunity while avoiding extreme values driven by sparse historical case counts.
+
+
+```{r attack_rate, fig.width=6, fig.height=4, warning=FALSE}
+# join onto ALL patches so every patch gets a value
+sero_base <- unipix %>%
+  dplyr::select(patchID, pop, x, y) %>%
+  left_join(
+    pastdat_year %>% dplyr::select(patchID, Number_of_cases),
+    by = "patchID"
+  ) %>%
+  mutate(
+    Number_of_cases = ifelse(is.na(Number_of_cases), 0L, Number_of_cases),
+    ar = Number_of_cases / pmax(pop, 1)
+  )
+
+ar_range <- range(sero_base$ar, na.rm = TRUE)
+
+ggplot(sero_base) +
+  geom_tile(aes(x = x, y = y, fill = ar), width = 0.005, height = 0.005) +
+  coord_equal() +
+  scale_fill_gradient(low = "grey95", high = "blue", name = "Attack rate") +
+  labs(
+    title = paste0(
+      "Attack rate (range: ",
+      round(ar_range[1], 4), " – ",
+      round(ar_range[2], 4), ")"
+    ),
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal()
+```
+
+```{r build_immunity_landscape, fig.width=6, fig.height=4, warning=FALSE}
+# robust scaling to 0..1 (uses a high quantile cap)
+q_hi <- quantile(sero_base$ar, 0.95, na.rm = TRUE)
+# map to immunity range (based on Périssé et al. 2020, Honório et al. 2009, and others)
+stim_min <- 0.4
+stim_max <- 0.8
+sero_base <- sero_base %>%
+  mutate(
+    z = if (q_hi > 0) pmin(ar / q_hi, 1) else 0,
+    stim_vec_raw = stim_min + (stim_max - stim_min) * z
+  )
+
+# build stim_vec from historical attack rate (linear scaling relative to the 95th percentile)
+# haversine distances (m) from lon/lat
+pixdistmat <- geosphere::distm(
+  unipix[, c("x", "y")],
+  fun = geosphere::distHaversine
+)
+save(pixdistmat, file = "data/pixdistmat_rio.rda") #save to rda file
+
+stim_vec <- sero_base$stim_vec_raw
+sero_base$stim_vec <- stim_vec
+save(stim_vec, file = "data/stim_vec_rio.rda") #save to rda file
+
+# plot scaled stim_vec
+ggplot(sero_base) +
+  geom_tile(aes(x = x, y = y, fill = stim_vec_raw), width = 0.005, height = 0.005) +
+  coord_equal() +
+  scale_fill_gradient(low = "grey95", high = "blue", name = "Immunity") +
+  labs(
+    title = paste0("Scaled immunity landscape (min: ", stim_min, " – max: ", stim_max, ")"),
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal()
+```
+
+```{r immunity_landscape_figure, fig.width=6, fig.height=4, warning=FALSE}
+# plot scaled stim_vec
+immunity_landscape_fig <- ggplot(sero_base) +
+  geom_tile(aes(x = x, y = y, fill = stim_vec), width = 0.005, height = 0.005) +
+  coord_equal() +
+  scale_fill_gradient(low = "grey80", high = "black", name = "Immunity") +
+  labs(
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal()
+
+immunity_landscape_fig
+ggsave("FIGURE_immunity_landscape.png", plot = immunity_ladscape_fig, width = 10, height = 5.12, dpi = 300)
+```
+
+### Check: correlation between preceding-season and fitted-season attack rates
+
+Supports interpretation of the fitted transmission–immunity correlation (`betaEnv_cor`):
+patches with more cases in Nov 2010–Oct 2011 also had more cases in the fitted season.
+
+```{r season_attack_rate_correlation}
+ar_fit <- obs_monthly_patch %>%
+  group_by(patchID) %>%
+  summarise(cases = sum(Number_of_cases), .groups = "drop") %>%
+  right_join(unipix %>% dplyr::select(patchID, pop), by = "patchID") %>%
+  mutate(cases = coalesce(cases, 0), ar = cases / pop) %>%
+  arrange(patchID) %>%
+  pull(ar)
+
+ar_prev <- sero_base$ar        # Nov 2010–Oct 2011 attack rate, unipix (patchID) order
+stopifnot(length(ar_prev) == length(ar_fit))
+
+season_ar_cor <- cor(ar_prev, ar_fit, method = "spearman", use = "complete.obs")
+season_ar_cor
+```
+
+
+#   Step 2. a. Define prior distributions
+
+Priors were retained from the original refitting framework in Brady et al. (2021). The daily detection probability pdetec was not fitted during SMC; it was fixed at 0.01 during simulation and estimated post hoc as a scaling factor after fitting.
+
+```{r define_priors}
+
+# Effective reproduction number at outbreak start, as calculated in DEN.spatial()
+calc_Rt <- function(betaEnv_mean, mospdeath, stim_vec) {
+  VC <- (5.457631 / 8) * betaEnv_mean^2 * (1 - mospdeath)^7 / (-log(1 - mospdeath))
+  8 * VC * (1 - mean(stim_vec))
+}
+# Brady et al. (2021): only accept parameter sets with 1 < Rt < 10
+Rt_ok <- function(theta) {
+  Rt <- calc_Rt(theta$betaEnv_mean, theta$mospdeath, stim_vec)
+  Rt > 1 && Rt < 10
+}
+
+sample_from_priors <- function(movement_model) {
+  repeat {
+    theta <- list(
+      hometime       = runif(1, 0, 1),              # k: movement distance-scaling
+      mospdeath      = rbeta(1, 11.93, 107.4),      # mu_n
+      betaEnv_mean   = runif(1, 0.1, 2),            # beta_mu, as Brady et al. (2021)
+      betaEnv_cor    = runif(1, -1, 1),             # beta_rho
+      Mov_model_type = movement_model
+    )
+    if (Rt_ok(theta)) return(theta)
+  }
+}
+
+```
+
+#### Set up one example parameter set for manual testing / debugging:
+
+```{r priors}
+# parameter prerequisites
+theta_test <- list(
+  hometime = 0.4,
+  mospdeath = 0.08,
+  betaEnv_mean = 0.35,
+  betaEnv_cor = 0.2,
+  Mov_model_type = "exponential"
+)
+```
+
+#   Step 2.  b. Define observed summary statistics
+
+Observed cases are reduced into temporal and spatial summaries that can be compared against simulations. First define 12 monthly temporal bins and five release-zone spatial bins informed by Wolbachia deployment programme.
+
+```{r spatial_bins_release_zones_check}
+
+# Exploratory check: are the five release zones suitable spatial summary bins?
+# (case numbers and sampling noise per zone, stability of shares across seasons, monthly cases)
+
+# cells ever in the project
+proj_cells <- unique(wmel_rio$cell.id[wmel_rio$In.project])
+
+# one zone and population per cell (check each cell has a single zone)
+cell_info <- wmel_rio %>%
+  filter(cell.id %in% proj_cells) %>%
+  group_by(cell.id) %>%
+  summarise(n_zones = n_distinct(release_zone),
+            zone    = first(release_zone),
+            pop     = first(Population), .groups = "drop")
+table(cell_info$n_zones)              # should be all 1
+
+cases <- wmel_rio %>%
+  filter(cell.id %in% proj_cells, !is.na(date)) %>%
+  dplyr::select(cell.id, date, dengue_cases) %>%
+  left_join(cell_info %>% dplyr::select(cell.id, zone), by = "cell.id") %>%
+  mutate(month  = floor_date(as.Date(date), "month"),
+         season = case_when(
+           month >= as.Date("2010-11-01") & month < as.Date("2011-11-01") ~ "2010-11",
+           month >= as.Date("2011-11-01") & month < as.Date("2012-11-01") ~ "2011-12 (fit)",
+           month >= as.Date("2012-11-01") & month < as.Date("2013-11-01") ~ "2012-13")) %>%
+  filter(!is.na(season))
+
+# 1. Size, burden and sampling noise per zone in the fitting year
+cases %>%
+  filter(season == "2011-12 (fit)") %>%
+  group_by(zone) %>%
+  summarise(cases = sum(dengue_cases, na.rm = TRUE), .groups = "drop") %>%
+  left_join(cell_info %>% group_by(zone) %>%
+              summarise(n_cells = n(), pop = sum(pop, na.rm = TRUE)), by = "zone") %>%
+  mutate(share        = cases / sum(cases),
+         per_10k      = 1e4 * cases / pop,
+         rel_noise_pc = 100 * sqrt(share * (1 - share) / sum(cases)) / share)
+
+# 2. Stability of each zone's share across seasons
+cases %>%
+  group_by(season, zone) %>%
+  summarise(cases = sum(dengue_cases, na.rm = TRUE), .groups = "drop_last") %>%
+  mutate(share = round(cases / sum(cases), 3)) %>%
+  dplyr::select(-cases) %>%
+  pivot_wider(names_from = season, values_from = share)
+
+# 3. Monthly cases per zone in the fitting year
+cases %>%
+  filter(season == "2011-12 (fit)") %>%
+  count(month, zone, wt = dengue_cases, name = "cases") %>%
+  pivot_wider(names_from = zone, values_from = cases, values_fill = 0)
+
+```
+
+
+```{r prepare_observed_summary_stats}
+
+# ---- Temporal bins: months -> bins ----
+month_to_bin <- seq_len(n_months)                  # 12 monthly bins
+n_time_bins  <- max(month_to_bin)
+
+# ---- Spatial bins: release zones (replaces k-means clusters) ----
+patch_bins_fixed <- unipix %>%
+  dplyr::select(patchID, pixID, x, y) %>%
+  dplyr::left_join(cell_info %>% dplyr::select(cell.id, zone),
+                   by = c("pixID" = "cell.id")) %>%
+  dplyr::mutate(space_bin = as.integer(factor(zone))) %>%   # RJ1 = 1 ... RJ3.3 = 5
+  dplyr::arrange(patchID)
+stopifnot(!any(is.na(patch_bins_fixed$space_bin)))
+n_space_bins <- dplyr::n_distinct(patch_bins_fixed$space_bin)
+
+# ---- Observed summaries from real monthly patch counts ----
+obs_total_cases <- sum(obs_monthly_patch$Number_of_cases)
+
+obs_time_counts <- obs_monthly_patch %>%
+  dplyr::mutate(time_bin = month_to_bin[month_index]) %>%
+  dplyr::group_by(time_bin) %>%
+  dplyr::summarise(cases = sum(Number_of_cases), .groups = "drop")
+obs_time_counts <- with(obs_time_counts, { out <- rep(0, n_time_bins); out[time_bin] <- cases; out })
+obs_time_rel <- obs_time_counts / sum(obs_time_counts)
+
+obs_space_counts <- obs_monthly_patch %>%
+  dplyr::left_join(patch_bins_fixed %>% dplyr::select(patchID, space_bin), by = "patchID") %>%
+  dplyr::group_by(space_bin) %>%
+  dplyr::summarise(cases = sum(Number_of_cases), .groups = "drop")
+obs_space_counts <- with(obs_space_counts, { out <- rep(0, n_space_bins); out[space_bin] <- cases; out })
+obs_space_rel <- obs_space_counts / sum(obs_space_counts)
+
+```
+
+Validate fixed bins, check where and how they're defined.
+
+```{r validate_bins, fig.width=6, fig.height=4, warning=FALSE}
+
+cat("=== Fixed bin validation checks ===\n")
+cat("Months in fitting window:", n_months, "| days simulated:", n_days, "\n")
+cat("Months per temporal bin:\n"); print(table(month_to_bin))
+
+cat("\nPatches per release zone:\n"); print(table(patch_bins_fixed$zone))
+
+cat("\nObserved cases - total:", obs_total_cases,
+    "| temporal bins:", sum(obs_time_counts),
+    "| spatial bins:", sum(obs_space_counts), "\n")
+print(round(setNames(obs_space_rel, levels(factor(patch_bins_fixed$zone))), 3))
+
+stopifnot(
+  n_days == 366,
+  length(month_to_bin) == n_months,
+  nrow(patch_bins_fixed) == nrow(unipix),
+  all(sort(unique(patch_bins_fixed$space_bin)) == seq_len(n_space_bins)),
+  sum(obs_time_counts)  == obs_total_cases,
+  sum(obs_space_counts) == obs_total_cases
+)
+
+ggplot(patch_bins_fixed, aes(x = x, y = y, fill = zone)) +
+  geom_tile(width = 0.005, height = 0.005) +
+  coord_equal() +
+  labs(title = "Spatial summary units: release zones",
+       x = "Longitude", y = "Latitude", fill = "Release zone") +
+  theme_minimal()
+
+```
+
+
+#   Step 2.   c. Simulator wrapper
+
+This wraps DEN.spatial() so that one sampled parameter set can be run and reduced to the same summary statistics as the observed outbreak.
+
+```{r pre-compute_lookup_vectors}
+# months -> temporal bin (one value per month)
+time_bins_fixed <- month_to_bin
+
+# patches -> release zone bin (one value per patch, in unipix order)
+patch_bins_fixed <- patch_bins_fixed$space_bin[match(unipix$patchID, patch_bins_fixed$patchID)]
+
+stopifnot(length(time_bins_fixed) == n_months)
+stopifnot(length(day_month) == n_days)
+stopifnot(length(patch_bins_fixed) == length(unipix$patchID))
+stopifnot(!any(is.na(patch_bins_fixed)))
+```
+
+```{r set_up_simulation_wrapper}
+run_particle <- function(theta,
+                         timestep,
+                         fitdat,
+                         pastdat,
+                         sgpop,
+                         unipix,
+                         pixdistmat,
+                         steprun,
+                         stim_vec,
+                         time_bins_fixed,
+                         patch_bins_fixed,
+                         pdetec_fixed = 0.01) {
+
+  if (is.numeric(theta$Mov_model_type)) {
+    theta$Mov_model_type <- c("exponential", "gravity", "radiation")[theta$Mov_model_type]
+  }
+
+  betaEnv_landscape <- betaEnv.generate(
+    bmean = theta$betaEnv_mean,
+    bcorrelation = theta$betaEnv_cor,
+    stim = stim_vec
+  )
+
+  paramsList <- list(
+    hometime = theta$hometime,
+    pdetec = pdetec_fixed,
+    mospdeath = theta$mospdeath,
+    stim = stim_vec,
+    betaEnv = betaEnv_landscape,
+    Mov_model_type = theta$Mov_model_type
+  )
+
+  sim <- DEN.spatial(
+    timestep = timestep,
+    fitdat = fitdat,
+    pastdat = pastdat,
+    sgpop = sgpop,
+    unipix = unipix,
+    pixdistmat = pixdistmat,
+    steprun = steprun,
+    paramsList = paramsList
+  )
+
+  if (is.na(sim)[1]) return(NA)
+
+  patch_daily <- sim[[2]]
+  newD_mat <- do.call(rbind, lapply(patch_daily, function(df) df$newD))
+
+  if (ncol(newD_mat) != length(unipix$patchID)) {
+    stop("Mismatch in patch dimensions: newD_mat has ", ncol(newD_mat),
+         " columns but unipix has ", length(unipix$patchID), " patches.")
+  }
+  if (nrow(newD_mat) != n_days) {
+    stop("Mismatch in simulation length: expected ", n_days,
+         " days, got ", nrow(newD_mat), ". Check steprun = n_days.")
+  }
+
+  # helper
+  sum_by_group_fixed <- function(values, group, n_groups) {
+    tmp <- rowsum(matrix(values, ncol = 1), group = group, reorder = FALSE)
+    out <- rep(0, n_groups)
+    out[as.integer(rownames(tmp))] <- tmp[, 1]
+    out
+  }
+
+  # days -> calendar months (rows = months, cols = patches)
+  monthly_patch_mat <- rowsum(newD_mat, group = day_month, reorder = TRUE)
+
+  monthly_totals <- rowSums(monthly_patch_mat)   # temporal summary
+  patch_totals   <- colSums(monthly_patch_mat)   # spatial summary
+
+  n_time_bins  <- max(time_bins_fixed)
+  n_space_bins <- max(patch_bins_fixed)
+
+  sim_time_counts  <- sum_by_group_fixed(monthly_totals, time_bins_fixed,  n_time_bins)
+  sim_space_counts <- sum_by_group_fixed(patch_totals,   patch_bins_fixed, n_space_bins)
+
+  list(
+    sim = sim,
+    sim_time_counts = sim_time_counts,
+    sim_space_counts = sim_space_counts
+  )
+}
+```
+
+#   Step 2.    d. Manual simulator check
+
+#### First, one manual run with assigned priors
+
+```{r manual_test_run}
+pred_test <- run_particle(
+  theta = theta_test,
+  timestep = timestep,
+  fitdat = fitdat,
+  pastdat = pastdat,
+  sgpop = riopop,
+  unipix = unipix,
+  pixdistmat = pixdistmat,
+  steprun = n_days,
+  stim_vec = stim_vec,
+  time_bins_fixed = time_bins_fixed,
+  patch_bins_fixed = patch_bins_fixed
+)
+
+str(pred_test, max.level = 1)
+
+sim_test_time_rel  <- pred_test$sim_time_counts / sum(pred_test$sim_time_counts)
+sim_test_space_rel <- pred_test$sim_space_counts / sum(pred_test$sim_space_counts)
+
+print("Compare observed vs simulated temporal")
+rbind(observed = obs_time_rel, simulated = sim_test_time_rel)
+
+print("Compare observed vs simulated spatial")
+rbind(observed = obs_space_rel, simulated = sim_test_space_rel)
+
+```
+
+```{r manual_test_plots}
+plot(obs_time_rel, type = "b",
+     ylim = c(0, max(c(obs_time_rel, sim_test_time_rel))),
+     main = "Observed vs simulated temporal summaries (manual test)",
+     xlab = "Time bin", ylab = "Relative frequency")
+lines(sim_test_time_rel, type = "b", lty = 2)
+legend("topleft", legend = c("Observed", "Simulated"), lty = c(1, 2), bty = "n")
+
+plot(obs_space_rel, type = "b",
+     ylim = c(0, max(c(obs_space_rel, sim_test_space_rel))),
+     main = "Observed vs simulated spatial summaries (manual test)",
+     xlab = "Spatial bin", ylab = "Relative frequency")
+lines(sim_test_space_rel, type = "b", lty = 2)
+legend("topleft", legend = c("Observed", "Simulated"), lty = c(1, 2), bty = "n")
+```
+
+#### Second, a small batch simulator runs with prior draws
+
+Here we sample parameter sets from the priors and run multiple simulations in parallel.
+
+```{r small_batch_simulation}
+set.seed(1)
+
+# adjust replicate with number of simulations, e.g. 5 for debug or 50 for test
+n_runs <- 5
+thetas <- replicate(n_runs, sample_from_priors(movement_model = "exponential"), simplify = FALSE)
+
+# parallelise for efficient runtimes
+outs <- mclapply(
+  thetas,
+  run_particle,
+  timestep = timestep,
+  fitdat = fitdat,
+  pastdat = pastdat,
+  sgpop = riopop,
+  unipix = unipix,
+  pixdistmat = pixdistmat,
+  steprun = n_days,
+  stim_vec = stim_vec,
+  time_bins_fixed = time_bins_fixed,
+  patch_bins_fixed = patch_bins_fixed,
+  mc.cores = 8
+)
+```
+
+```{r small_batch_plot}
+newD_ex <- do.call(rbind, lapply(outs[[1]]$sim[[2]], function(df) df$newD))
+monthly_ex <- tapply(rowSums(newD_ex), day_month, sum)
+
+plot(seq_len(n_months), monthly_ex, type = "b",
+     xlab = "Month of fitting window", ylab = "Detected cases",
+     main = "Simulated monthly total (example prior draw)")
+```
+
+```{r small_batch_diagnostics}
+cat("Correct number of runs:", length(outs) == n_runs, "\n")
+cat("All non-null:", all(!sapply(outs, is.null)), "\n")
+cat("Summaries have the right length:",
+    all(sapply(outs, function(x) length(x$sim_time_counts)  == n_time_bins)) &&
+    all(sapply(outs, function(x) length(x$sim_space_counts) == n_space_bins)), "\n")
+
+cat("Example output structure:\n")
+str(outs[[1]], max.level = 1)
+```
+
+#### Compare one example run to observed summaries
+
+```{r observed_data}
+obs_monthly <- obs_monthly_patch %>%
+  dplyr::group_by(month_index) %>%
+  dplyr::summarise(cases = sum(Number_of_cases), .groups = "drop") %>%
+  dplyr::arrange(month_index)
+
+obs_peak_month <- obs_monthly$month_index[which.max(obs_monthly$cases)]
+obs_peak_size  <- max(obs_monthly$cases)
+cat("Observed peak month:", format(month_levels[obs_peak_month], "%b %Y"), "\n")
+cat("Observed peak size:", obs_peak_size, "\n")
+
+obs_peak_bin <- which.max(obs_time_counts)
+obs_peak_size_bin <- max(obs_time_counts)
+
+cat("Observed peak temporal bin:", obs_peak_bin, "\n")
+cat("Observed peak bin count:", obs_peak_size_bin, "\n")
+```
+
+```{r small_batch_compare_one}
+sim1_time_rel  <- outs[[1]]$sim_time_counts / sum(outs[[1]]$sim_time_counts)
+sim1_space_rel <- outs[[1]]$sim_space_counts / sum(outs[[1]]$sim_space_counts)
+
+print("Compare observed vs simulated temporal")
+rbind(observed = obs_time_rel, simulated = sim1_time_rel)
+
+print("Compare observed vs simulated spatial")
+rbind(observed = obs_space_rel, simulated = sim1_space_rel)
+```
+
+#### Total epidemic size across prior draws
+
+```{r small_batch_total_cases}
+total_sim_cases <- sapply(outs, function(x) sum(x$sim_time_counts))
+print(total_sim_cases)
+summary(total_sim_cases)
+```
+
+Also check the month to month cases:
+-  all zeros → transmission too low
+-  extremely huge numbers → beta too high
+-  very wide variation → priors are broad (expected)
+
+```{r small_batch_overlay_plot_time}
+plot(obs_time_rel, type = "b",
+     ylim = c(0, max(obs_time_rel)),
+     main = "Observed vs simulated temporal summaries across prior draws",
+     ylab = "Relative frequency",
+     xlab = "Time bin")
+
+for (i in seq_along(outs)) {
+  lines(outs[[i]]$sim_time_counts / sum(outs[[i]]$sim_time_counts),
+        col = rgb(1, 0, 0, 0.3))
+}
+```
+
+```{r small_batch_overlay_plot_space}
+plot(obs_space_rel, type = "b",
+     ylim = c(0, max(obs_space_rel)),
+     main = "Observed vs simulated spatial summaries across prior draws",
+     ylab = "Relative frequency",
+     xlab = "Spatial bin")
+
+for (i in seq_along(outs)) {
+  lines(outs[[i]]$sim_space_counts / sum(outs[[i]]$sim_space_counts),
+        col = rgb(1, 0, 0, 0.3))
+}
+```
+
+```{r extract_monthly_totals}
+extract_sim_monthly_total <- function(sim_obj) {
+  newD_mat <- do.call(rbind, lapply(sim_obj[[2]], function(df) df$newD))
+  monthly_total <- tapply(rowSums(newD_mat), day_month, sum)
+  data.frame(month_index = as.integer(names(monthly_total)),
+             cases = as.numeric(monthly_total))
+}
+```
+
+And final check the outbreak time series:
+```{r small_batch_epidemic_curve, fig.width=8, fig.height=6}
+plot(obs_monthly$month_index, obs_monthly$cases,
+     type = "b", lwd = 2, col = "black",
+     ylim = c(0, max(obs_monthly$cases) * 1.5),
+     xlab = "Month of fitting window", ylab = "Cases",
+     main = "Observed vs simulated monthly epidemic curves across prior draws")
+
+for (i in seq_along(outs)) {
+  if (is.null(outs[[i]]) || is.null(outs[[i]]$sim)) next
+  sim_m <- extract_sim_monthly_total(outs[[i]]$sim)
+  lines(sim_m$month_index, sim_m$cases, col = rgb(1, 0, 0, 0.2))
+}
+legend("topright", legend = c("Observed", "Prior draw"), lty = 1, lwd = c(2, 1),
+       col = c("black", rgb(1, 0, 0, 0.5)), bty = "n")
+```
+
+Prior predictive simulations, using the published β_μ prior (U(0.1, 2)) with only parameter sets giving an initial effective reproduction number between 1 and 10 accepted, produced a range of epidemic trajectories differing in size, timing and spatial distribution. This indicates that the prior space is broad enough for ABC-SMC fitting while the reproduction number constraint excludes the most implausible regimes, such as epidemics that fail to grow or saturate immediately.
+
+```{r simulated_peak_summaries}
+sim_peak_summary <- lapply(outs, function(x) {
+  sim_m <- extract_sim_monthly_total(x$sim)
+  c(peak_month = sim_m$month_index[which.max(sim_m$cases)],
+    peak_size  = max(sim_m$cases),
+    peak_bin = which.max(x$sim_time_counts),
+    peak_bin_count = max(x$sim_time_counts))
+})
+
+sim_peak_summary <- do.call(rbind, sim_peak_summary)
+summary(as.data.frame(sim_peak_summary))
+```
+
+#### Conclusion to simulation testing
+
+The manual and small-batch checks confirm that the simulator wrapper runs as intended: simulations complete, outputs have the expected dimensions, and simulated detected cases can be summarised into the same 12 monthly and five release-zone bins as the observed data. Together with the prior predictive checks above, this supports proceeding to ABC-SMC fitting.
+
+```{r save_each_round_backup}
+checkpoint_dir <- "smc_checkpoints"
+dir.create(checkpoint_dir, showWarnings = FALSE)
+
+checkpoint_file <- function(movement_model, round_num, checkpoint_dir = "smc_checkpoints") {
+  file.path(checkpoint_dir, paste0("smc_", movement_model, "_round", round_num, ".rds"))
+}
+```
+
+#    Step 3. a. Define distance function and fitting criteria
+
+To compare simulations against the observed outbreak, we define a simple distance function based on squared deviations between observed and simulated relative frequencies in both time and space. Smaller values indicate closer agreement.
+
+```{r define_distance_function}
+compute_distance <- function(pred, obs_time_rel, obs_space_rel) {
+
+  if (length(pred$time_rel) != length(obs_time_rel)) {
+    stop("Temporal summary lengths do not match.")
+  }
+  if (length(pred$space_rel) != length(obs_space_rel)) {
+    stop("Spatial summary lengths do not match.")
+  }
+
+  time_dev  <- sum((obs_time_rel  - pred$time_rel)^2)
+  space_dev <- sum((obs_space_rel - pred$space_rel)^2)
+  
+  total_dev <- time_dev + space_dev
+
+  list(
+    total = total_dev,
+    time  = time_dev,
+    space = space_dev
+  )
+}
+```
+
+#    Step 3.  b Stochastic evaluation of parameter sets
+
+Following the published fitting workflow, each sampled parameter set is evaluated using the median prediction from 10 stochastic model simulations, reducing Monte Carlo noise in the fitting objective.
+
+```{r median_of_10_wrapper}
+# helper: convert one simulation output to relative summaries
+make_relative_summaries <- function(pred, timestep) {
+  if (is.null(pred)) return(NULL)
+  if (is.atomic(pred) && any(is.na(pred))) return(NULL)
+
+  if (sum(pred$sim_time_counts) <= 0) return(NULL)
+  if (sum(pred$sim_space_counts) <= 0) return(NULL)
+
+  sim_m <- extract_sim_monthly_total(pred$sim)
+  if (is.null(sim_m) || nrow(sim_m) == 0) return(NULL)
+
+  list(
+    time_rel = pred$sim_time_counts / sum(pred$sim_time_counts),
+    space_rel = pred$sim_space_counts / sum(pred$sim_space_counts),
+    total_detected = sum(sim_m$cases, na.rm = TRUE),
+    monthly_counts = sim_m$cases
+  )
+}
+
+# run the model n_reps times for one theta, then take median summaries
+evaluate_theta_median <- function(theta,
+                                  pdetec_fixed = 0.01,
+                                  timestep,
+                                  fitdat,
+                                  pastdat,
+                                  sgpop,
+                                  unipix,
+                                  pixdistmat,
+                                  stim_vec,
+                                  time_bins_fixed = time_bins_fixed,
+                                  patch_bins_fixed = patch_bins_fixed,
+                                  n_reps = 10,
+                                  steprun = n_days) {
+
+  preds <- vector("list", n_reps)
+
+  for (r in seq_len(n_reps)) {
+    pred_r <- run_particle(
+      theta = theta,
+      timestep = timestep,
+      fitdat = fitdat,
+      pastdat = pastdat,
+      sgpop = sgpop,
+      unipix = unipix,
+      pixdistmat = pixdistmat,
+      steprun = steprun,
+      stim_vec = stim_vec,
+      time_bins_fixed = time_bins_fixed,
+      patch_bins_fixed = patch_bins_fixed,
+      pdetec_fixed = pdetec_fixed
+    )
+    preds[[r]] <- make_relative_summaries(pred_r, timestep = timestep)
+  }
+
+  keep <- !vapply(preds, is.null, logical(1))
+  preds_ok <- preds[keep]
+
+  if (length(preds_ok) == 0) return(NULL)
+
+  time_mat <- do.call(rbind, lapply(preds_ok, `[[`, "time_rel"))
+  space_mat <- do.call(rbind, lapply(preds_ok, `[[`, "space_rel"))
+  monthly_mat <- do.call(rbind, lapply(preds_ok, `[[`, "monthly_counts"))
+  total_vec <- vapply(preds_ok, `[[`, numeric(1), "total_detected")
+
+  list(
+    time_rel = apply(time_mat, 2, median, na.rm = TRUE),
+    space_rel = apply(space_mat, 2, median, na.rm = TRUE),
+    monthly_counts = apply(monthly_mat, 2, median, na.rm = TRUE),
+    total_detected = median(total_vec, na.rm = TRUE),
+    n_success = length(preds_ok)
+  )
+}
+```
+
+#    Step 3.   c. Sequential Monte Carlo algorithm
+
+#### Proposal functions for SMC rounds 2 and 3
+
+In round 1, particles are sampled from the prior. In rounds 2 and 3, particles are sampled from the previous accepted set and each parameter is perturbed uniformly by up to ±10%, following the paper’s SMC procedure.
+
+```{r smc_proposal_functions}
+# sample from round-1 priors
+sample_theta_round1 <- function(movement_model) {
+  sample_from_priors(movement_model)
+}
+
+# perturb one accepted theta by up to +/-10%
+perturb_theta <- function(theta_prev, movement_model) {
+  theta_new <- theta_prev
+  theta_new$hometime <- min(max(theta_prev$hometime * runif(1, 0.9, 1.1), 0), 1)
+  theta_new$mospdeath <- min(max(theta_prev$mospdeath * runif(1, 0.9, 1.1), 1e-8), 0.999)
+  theta_new$betaEnv_mean <- min(max(theta_prev$betaEnv_mean * runif(1, 0.9, 1.1), 0.1), 2)
+  theta_new$betaEnv_cor <- min(max(theta_prev$betaEnv_cor + runif(1, -0.1, 0.1), -1), 1)
+  theta_new$Mov_model_type <- movement_model
+  theta_new
+}
+
+# sample one theta for a given round
+sample_theta_smc <- function(round_num, movement_model, accepted_prev = NULL) {
+  if (round_num == 1) return(sample_theta_round1(movement_model))
+  repeat {
+    idx <- sample(seq_len(nrow(accepted_prev)), 1)
+    theta_prev <- list(
+      hometime = accepted_prev$hometime[idx],
+      mospdeath = accepted_prev$mospdeath[idx],
+      betaEnv_mean = accepted_prev$betaEnv_mean[idx],
+      betaEnv_cor = accepted_prev$betaEnv_cor[idx],
+      Mov_model_type = movement_model
+    )
+    theta_new <- perturb_theta(theta_prev, movement_model)
+    if (Rt_ok(theta_new)) return(theta_new)
+  }
+}
+```
+
+#### One particle
+
+This helper samples one theta, runs the model, computes the distance, and returns either a one-row dataframe or NULL.
+
+```{r run_one_particle_helper}
+evaluate_one_particle <- function(round_num,
+                                  movement_model,
+                                  accepted_prev,
+                                  timestep,
+                                  fitdat,
+                                  pastdat,
+                                  sgpop,
+                                  unipix,
+                                  pixdistmat,
+                                  stim_vec,
+                                  time_bins_fixed,
+                                  patch_bins_fixed,
+                                  obs_time_rel,
+                                  obs_space_rel,
+                                  n_reps,
+                                  steprun,
+                                  pdetec_fixed = 0.01) {
+  tryCatch({
+    theta <- sample_theta_smc(
+      round_num = round_num,
+      movement_model = movement_model,
+      accepted_prev = accepted_prev
+    )
+
+    pred <- evaluate_theta_median(
+    theta = theta,
+    timestep = timestep,
+    fitdat = fitdat,
+    pastdat = pastdat,
+    sgpop = sgpop,
+    unipix = unipix,
+    pixdistmat = pixdistmat,
+    stim_vec = stim_vec,
+    time_bins_fixed = time_bins_fixed,
+    patch_bins_fixed = patch_bins_fixed,
+    n_reps = n_reps,
+    steprun = steprun,
+    pdetec_fixed = pdetec_fixed
+    )
+
+    if (is.null(pred)) return(NULL)
+
+    d <- compute_distance(
+      pred = pred,
+      obs_time_rel = obs_time_rel,
+      obs_space_rel = obs_space_rel
+    )
+
+    tibble::tibble(
+      round = round_num,
+      movement_model = movement_model,
+      hometime = theta$hometime,
+      mospdeath = theta$mospdeath,
+      betaEnv_mean = theta$betaEnv_mean,
+      betaEnv_cor = theta$betaEnv_cor,
+      Mov_model_type = as.character(theta$Mov_model_type),
+      n_success = pred$n_success,
+      totaldevs = d$total,
+      timedevs_R = d$time,
+      spacedevs_R = d$space,
+      sim_total_fixed = pred$total_detected,
+      sim_monthly_fixed = list(pred$monthly_counts)
+    )
+  }, error = function(e) {
+    message("evaluate_one_particle error: ", conditionMessage(e))
+    NULL
+  })
+}
+```
+
+##### One SMC round
+
+Each SMC round generates 1,000 particles. Parameter combinations are evaluated using the median of 10 simulations, sum of squared differences, and then ranked by distance. The top 10% are retained for the next round. This version of the function evaluates particles in parallel batches, keeps going until it has n_particles valid particles, then adds particle IDs afterwards.
+
+```{r run_one_smc_round_helper}
+run_smc_round <- function(round_num,
+                          movement_model,
+                          n_particles,
+                          accepted_prev = NULL,
+                          timestep,
+                          fitdat,
+                          pastdat,
+                          sgpop,
+                          unipix,
+                          pixdistmat,
+                          stim_vec,
+                          time_bins_fixed,
+                          patch_bins_fixed,
+                          obs_time_rel,
+                          obs_space_rel,
+                          n_reps = 10,
+                          pdetec_fixed = 0.01,
+                          keep_frac = 0.10,
+                          verbose_every = 50,
+                          mc.cores_outer = 4,
+                          batch_size = NULL) {
+
+  round_start_time <- Sys.time()
+  steprun <- n_days
+
+  if (is.null(batch_size)) {
+    batch_size <- mc.cores_outer
+  }
+
+  cat("==============================\n")
+  cat(sprintf("START Round %d (%s)\n", round_num, movement_model))
+  cat("Start time:", format(round_start_time), "\n")
+
+  with_progress({
+    p <- progressor(steps = n_particles)
+
+    results <- list()
+    n_collected <- 0
+
+    while (n_collected < n_particles) {
+
+      n_to_try <- max(batch_size, n_particles - n_collected)
+      
+      batch_res <- parallel::mclapply(
+        seq_len(n_to_try),
+        function(j) {
+          evaluate_one_particle(
+            round_num = round_num,
+            movement_model = movement_model,
+            accepted_prev = accepted_prev,
+            timestep = timestep,
+            fitdat = fitdat,
+            pastdat = pastdat,
+            sgpop = sgpop,
+            unipix = unipix,
+            pixdistmat = pixdistmat,
+            stim_vec = stim_vec,
+            time_bins_fixed = time_bins_fixed,
+            patch_bins_fixed = patch_bins_fixed,
+            obs_time_rel = obs_time_rel,
+            obs_space_rel = obs_space_rel,
+            n_reps = n_reps,
+            steprun = steprun,
+            pdetec_fixed = pdetec_fixed
+            )
+        },
+        mc.cores = mc.cores_outer,
+        mc.preschedule = FALSE
+      )
+
+      batch_res <- batch_res[vapply(batch_res, is.data.frame, logical(1))]
+
+      if (length(batch_res) == 0) next
+
+      for (res in batch_res) {
+        if (n_collected < n_particles) {
+          n_collected <- n_collected + 1
+          res$particle <- n_collected
+          results[[n_collected]] <- res
+          p(sprintf("Round %d [%d/%d]", round_num, n_collected, n_particles))
+
+          if (n_collected %% verbose_every == 0) {
+            elapsed <- Sys.time() - round_start_time
+            rate <- n_collected / as.numeric(elapsed, units = "secs")
+            eta <- (n_particles - n_collected) / rate
+
+            cat(sprintf(
+              "Round %d | particle %d/%d | elapsed: %.1f min | ETA: %.1f min\n",
+              round_num,
+              n_collected,
+              n_particles,
+              as.numeric(elapsed, units = "mins"),
+              eta / 60
+            ))
+          }
+        }
+      }
+    }
+
+    round_df <- dplyr::bind_rows(results)
+
+    round_df <- round_df %>%
+      dplyr::select(
+        round, particle, movement_model,
+        hometime, mospdeath, betaEnv_mean, betaEnv_cor,
+        Mov_model_type, n_success,
+        totaldevs, timedevs_R, spacedevs_R,
+        sim_total_fixed, sim_monthly_fixed
+      ) %>%
+      dplyr::arrange(totaldevs)
+
+    n_keep <- ceiling(keep_frac * nrow(round_df))
+    accepted <- round_df[seq_len(n_keep), ]
+
+    round_end_time <- Sys.time()
+    duration <- round_end_time - round_start_time
+
+    cat("End time:", format(round_end_time), "\n")
+    cat(sprintf("Duration: %.2f minutes\n", as.numeric(duration, units = "mins")))
+    cat("==============================\n")
+
+    list(
+      all_particles = round_df,
+      accepted = accepted
+    )
+  })
+}
+```
+
+##### Full 3-round workflow
+
+The published workflow uses three sequential SMC rounds. Round 1 samples from priors; rounds 2 and 3 sample from the previous accepted particles and perturb them by up to ±10%.
+
+```{r run_three_smc_rounds_helper}
+
+run_three_rounds_for_model <- function(movement_model,
+                                       n_particles,
+                                       timestep,
+                                       fitdat,
+                                       pastdat,
+                                       sgpop,
+                                       unipix,
+                                       pixdistmat,
+                                       stim_vec,
+                                       time_bins_fixed,
+                                       patch_bins_fixed,
+                                       obs_time_rel,
+                                       obs_space_rel,
+                                       n_reps = 10,
+                                       pdetec_fixed = 0.01,
+                                       keep_frac = 0.10,
+                                       mc.cores_outer = 4,
+                                       checkpoint_dir = "smc_checkpoints",
+                                       overwrite = FALSE) {
+  
+  dir.create(checkpoint_dir, showWarnings = FALSE, recursive = TRUE) # save each round in case of crashes
+  
+  if (length(n_reps) == 1) {
+  n_reps <- rep(n_reps, 3)
+  }
+  if (length(n_reps) != 3) {
+    stop("n_reps must be length 1 or length 3.")
+  }
+  
+  # tracking duration and model progress
+  model_start <- Sys.time()
+  cat("\n####################################\n")
+  cat("START MODEL RUN\n")
+  cat("Start time:", format(model_start), "\n")
+  cat("####################################\n")
+  
+  # ---------- ROUND 1 ----------
+  file_r1 <- checkpoint_file(movement_model, 1, checkpoint_dir)
+
+  if (file.exists(file_r1) && !overwrite) {
+    cat("Loading existing Round 1 checkpoint:", file_r1, "\n")
+    round1 <- readRDS(file_r1)
+  } else {
+  round1 <- run_smc_round(
+    round_num = 1,
+    movement_model = movement_model,
+    n_particles = n_particles,
+    accepted_prev = NULL,
+    timestep = timestep,
+    fitdat = fitdat,
+    pastdat = pastdat,
+    sgpop = sgpop,
+    unipix = unipix,
+    pixdistmat = pixdistmat,
+    stim_vec = stim_vec,
+    time_bins_fixed = time_bins_fixed,
+    patch_bins_fixed = patch_bins_fixed,
+    obs_time_rel = obs_time_rel,
+    obs_space_rel = obs_space_rel,
+    n_reps = n_reps[1],
+    pdetec_fixed = pdetec_fixed,
+    keep_frac = keep_frac,
+    mc.cores_outer = mc.cores_outer
+  )
+  saveRDS(round1, file_r1)
+    cat("Saved Round 1 checkpoint:", file_r1, "\n")
+  }
+  
+  # ---------- ROUND 2 ----------
+  file_r2 <- checkpoint_file(movement_model, 2, checkpoint_dir)
+
+  if (file.exists(file_r2) && !overwrite) {
+    cat("Loading existing Round 2 checkpoint:", file_r2, "\n")
+    round2 <- readRDS(file_r2)
+  } else {
+  round2 <- run_smc_round(
+    round_num = 2,
+    movement_model = movement_model,
+    n_particles = n_particles,
+    accepted_prev = round1$accepted,
+    timestep = timestep,
+    fitdat = fitdat,
+    pastdat = pastdat,
+    sgpop = sgpop,
+    unipix = unipix,
+    pixdistmat = pixdistmat,
+    stim_vec = stim_vec,
+    time_bins_fixed = time_bins_fixed,
+    patch_bins_fixed = patch_bins_fixed,
+    obs_time_rel = obs_time_rel,
+    obs_space_rel = obs_space_rel,
+    n_reps = n_reps[2],
+    pdetec_fixed = pdetec_fixed,
+    keep_frac = keep_frac,
+    mc.cores_outer = mc.cores_outer
+  )
+  saveRDS(round2, file_r2)
+    cat("Saved Round 2 checkpoint:", file_r2, "\n")
+  }
+  
+  # ---------- ROUND 3 ----------
+  file_r3 <- checkpoint_file(movement_model, 3, checkpoint_dir)
+
+  if (file.exists(file_r3) && !overwrite) {
+    cat("Loading existing Round 3 checkpoint:", file_r3, "\n")
+    round3 <- readRDS(file_r3)
+  } else {
+  round3 <- run_smc_round(
+    round_num = 3,
+    movement_model = movement_model,
+    n_particles = n_particles,
+    accepted_prev = round2$accepted,
+    timestep = timestep,
+    fitdat = fitdat,
+    pastdat = pastdat,
+    sgpop = sgpop,
+    unipix = unipix,
+    pixdistmat = pixdistmat,
+    stim_vec = stim_vec,
+    time_bins_fixed = time_bins_fixed,
+    patch_bins_fixed = patch_bins_fixed,
+    obs_time_rel = obs_time_rel,
+    obs_space_rel = obs_space_rel,
+    n_reps = n_reps[3],
+    pdetec_fixed = pdetec_fixed,
+    keep_frac = keep_frac,
+    mc.cores_outer = mc.cores_outer
+  )
+  saveRDS(round3, file_r3)
+    cat("Saved Round 3 checkpoint:", file_r3, "\n")
+  }
+
+  # tracking duration and model progress
+  model_end <- Sys.time()
+  total_time <- model_end - model_start
+
+  cat("####################################\n")
+  cat("END MODEL RUN\n")
+  cat("End time:", format(model_end), "\n")
+  cat(sprintf("TOTAL duration: %.2f hours | %.0f minutes\n", as.numeric(total_time, units = "hours"), as.numeric(total_time, units = "mins")))
+  cat("####################################\n\n")
+  
+  
+  fit_obj <- list(
+    movement_model = movement_model,
+    round1 = round1,
+    round2 = round2,
+    round3 = round3
+  )
+  
+  saveRDS(
+    fit_obj, file.path(checkpoint_dir, paste0("smc_", movement_model, "_fullfit.rds"))
+  )
+  
+  return(fit_obj)
+}
+
+```
+
+```{r run_three_smc_rounds_exponential, eval=FALSE}
+fit_exponential <- run_three_rounds_for_model(
+  movement_model = "exponential",
+  n_particles = 1000, # 1000 matches Brady paper
+  timestep = timestep,
+  fitdat = fitdat,
+  pastdat = pastdat,
+  sgpop = riopop,
+  unipix = unipix,
+  pixdistmat = pixdistmat,
+  stim_vec = stim_vec,
+  time_bins_fixed = time_bins_fixed,
+  patch_bins_fixed = patch_bins_fixed,
+  obs_time_rel = obs_time_rel,
+  obs_space_rel = obs_space_rel,
+  n_reps = 10, # 10 matches Brady paper
+  pdetec_fixed = 0.01, # fixed here because will be fitted posthoc for scaling
+  keep_frac = 0.10, # retain top 10%, matches Brady paper
+  mc.cores_outer = 8
+)
+```
+
+```{r run_three_smc_rounds_gravity, eval=FALSE}
+fit_gravity <- run_three_rounds_for_model(
+  movement_model = "gravity",
+  n_particles = 1000, # 1000 matches Brady paper
+  timestep = timestep,
+  fitdat = fitdat,
+  pastdat = pastdat,
+  sgpop = riopop,
+  unipix = unipix,
+  pixdistmat = pixdistmat,
+  stim_vec = stim_vec,
+  time_bins_fixed = time_bins_fixed,
+  patch_bins_fixed = patch_bins_fixed,
+  obs_time_rel = obs_time_rel,
+  obs_space_rel = obs_space_rel,
+  n_reps = 10, # 10 matches Brady paper
+  pdetec_fixed = 0.01, # fixed here because will be fitted posthoc for scaling
+  keep_frac = 0.10, # retain top 10%, matches Brady paper
+  mc.cores_outer = 8
+)
+```
+
+```{r run_three_smc_rounds_radiation, eval=FALSE}
+fit_radiation <- run_three_rounds_for_model(
+  movement_model = "radiation",
+  n_particles = 1000, # 1000 matches Brady paper
+  timestep = timestep,
+  fitdat = fitdat,
+  pastdat = pastdat,
+  sgpop = riopop,
+  unipix = unipix,
+  pixdistmat = pixdistmat,
+  stim_vec = stim_vec,
+  time_bins_fixed = time_bins_fixed,
+  patch_bins_fixed = patch_bins_fixed,
+  obs_time_rel = obs_time_rel,
+  obs_space_rel = obs_space_rel,
+  n_reps = 10, # 10 matches Brady paper
+  pdetec_fixed = 0.01, # fixed here because will be fitted posthoc for scaling
+  keep_frac = 0.10, # retain top 10%, matches Brady paper
+  mc.cores_outer = 8
+)
+```
+
+#    Step 3.    d. Movement model comparison and selection
+
+To evaluate alternative movement models, the full SMC-ABC fitting procedure was repeated separately for exponential, gravity, and radiation kernels. Models were compared based on the distribution of final-round distances, and the best-fitting model was selected for subsequent validation analyses.
+
+```{r load_movement_models}
+# load for knitting html
+fit_exponential <- readRDS("smc_checkpoints/smc_exponential_fullfit.rds")
+fit_gravity     <- readRDS("smc_checkpoints/smc_gravity_fullfit.rds")
+fit_radiation   <- readRDS("smc_checkpoints/smc_radiation_fullfit.rds")
+```
+
+```{r compare_movement_models}
+model_scores <- data.frame(
+  movement_model = c("exponential", "gravity", "radiation"),
+  final_min_dev = c(
+    min(fit_exponential$round3$accepted$totaldevs),
+    min(fit_gravity$round3$accepted$totaldevs),
+    min(fit_radiation$round3$accepted$totaldevs)
+  ),
+  final_median_dev = c(
+    median(fit_exponential$round3$accepted$totaldevs),
+    median(fit_gravity$round3$accepted$totaldevs),
+    median(fit_radiation$round3$accepted$totaldevs)
+  )
+)
+
+model_scores <- model_scores[order(model_scores$final_median_dev), ]
+model_scores
+```
+
+The three movement models were fitted independently using the same ABC-SMC settings. Radiation had the lowest final median discrepancy (0.0208), followed closely by exponential (0.0219), while gravity performed worse (0.0301). The minimum distances for radiation and exponential were very similar, indicating that model discrimination between these two kernels is modest under the current temporal/spatial summary statistics. Radiation was selected for subsequent validation because it had the lowest final median discrepancy.
+
+```{r best_movement_model}
+best_model_name <- model_scores$movement_model[which.min(model_scores$final_median_dev)]
+
+best_fit <- switch(
+  best_model_name,
+  exponential = fit_exponential,
+  gravity = fit_gravity,
+  radiation = fit_radiation
+)
+
+posterior_final <- best_fit$round3$accepted
+cat("Best-fitting movement model:", best_model_name, "\n")
+cat("Number of accepted particles in final round:", nrow(posterior_final), "\n")
+```
+
+#     Step 4. a. Simulation diagnostics
+
+Before interpreting convergence, we first check that SMC particles were evaluated successfully across rounds and that accepted particles arise from stable stochastic simulations.
+
+```{r smc_simulation_diagnostics}
+# Should accept 10% of particles from previous round
+cat("Accepted particles in round 1:", nrow(best_fit$round1$accepted), "\n")
+cat("Accepted particles in round 2:", nrow(best_fit$round2$accepted), "\n")
+cat("Accepted particles in round 3:", nrow(best_fit$round3$accepted), "\n")
+
+round_summary <- dplyr::bind_rows(
+  best_fit$round1$all_particles,
+  best_fit$round2$all_particles,
+  best_fit$round3$all_particles
+)
+
+cat("Best-fitting movement model:", best_model_name, "\n")
+cat("Accepted particles in round 1:", nrow(best_fit$round1$accepted), "\n")
+cat("Accepted particles in round 2:", nrow(best_fit$round2$accepted), "\n")
+cat("Accepted particles in round 3:", nrow(best_fit$round3$accepted), "\n")
+
+cat("\nMedian successful replicates per particle:\n")
+cat("Round 1:", median(best_fit$round1$all_particles$n_success), "\n")
+cat("Round 2:", median(best_fit$round2$all_particles$n_success), "\n")
+cat("Round 3:", median(best_fit$round3$all_particles$n_success), "\n")
+
+cat("\nRange of total distances by round:\n")
+print(tapply(round_summary$totaldevs, round_summary$round, range))
+```
+
+The selected radiation fit completed successfully across all three SMC rounds. Each round retained 100 accepted particles, corresponding to the intended top 10% of 1000 proposed particles. The median number of successful stochastic replicates per particle matched the intended values: 10. This suggests stable simulation behaviour and no evidence of systematic simulator failure.
+
+
+#     Step 4.  b. Convergence across SMC rounds
+
+As in the paper, fit should improve across rounds, although with diminishing returns. A simple way to check this is to compare the distance distributions round by round. 
+
+```{r compare_smc_rounds}
+aggregate(totaldevs ~ round, data = round_summary, summary)
+
+boxplot(totaldevs ~ round,
+        data = round_summary,
+        xlab = "SMC round",
+        ylab = "Total distance",
+        main = paste("Distance by SMC round -", best_model_name))
+```
+
+And for accepted particles:
+```{r accepted_round_comparison}
+accepted_summary <- dplyr::bind_rows(
+  best_fit$round1$accepted,
+  best_fit$round2$accepted,
+  best_fit$round3$accepted
+)
+
+boxplot(totaldevs ~ round,
+        data = accepted_summary,
+        xlab = "SMC round",
+        ylab = "Accepted particle distance",
+        main = paste("Accepted particles by round -", best_model_name))
+```
+
+The ABC-SMC algorithm showed clear convergence, with the total distance decreasing across rounds. The largest improvement occurred between rounds 1 and 2, with a smaller additional improvement in round 3, consistent with the expected behaviour of sequential particle refinement.
+
+#     Step 4.   c. Parameter learning (posterior vs sampled parameter space)
+
+Final check that data informs parameters:
+```{r parameter_learning}
+param_names <- c("hometime", "mospdeath", "betaEnv_mean", "betaEnv_cor")
+
+all_particles_for_learning <- dplyr::bind_rows(
+  best_fit$round1$all_particles,
+  best_fit$round2$all_particles,
+  best_fit$round3$all_particles
+)
+
+sapply(param_names, function(p) {
+  sd(posterior_final[[p]], na.rm = TRUE) / sd(all_particles_for_learning[[p]], na.rm = TRUE)
+})
+```
+
+Posterior-to-sampled standard deviation ratios, where lower values indicate greater learning from the data, suggested the strongest learning for the transmission parameters (betaEnv_mean and betaEnv_cor), moderate learning for mosquito mortality, and limited learning for the movement distance-scaling parameter (hometime). Because these ratios compare the final posterior with particles sampled across all rounds, rather than with the prior, they may understate learning for parameters that had already narrowed in earlier rounds.
+
+#      Step 5. a. Produce dataframe of final weights
+
+Two parameter tables are produced from the selected movement model. finalWeights_rio contains all 3,000 particles from the three SMC rounds and is saved as a record of the fit. finalWeights, saved to data/finalWeights.rda, is the version used by DEN.spatial(): it contains the 1,000 round-3 particles, weighted by 1 − d/max(d) following Brady et al. (2021), from which DEN.spatial() samples one parameter set per simulation. Neither table is restricted to the accepted particles, so posterior summaries are based on posterior_final instead.
+
+```{r finalWeights_rio}
+movement_code <- c(
+  exponential = 1,
+  gravity = 2,
+  radiation = 3
+)
+
+# default pdetec value used in fitting
+pdetec_fixed <- 0.01
+
+all_particles_rio <- dplyr::bind_rows(
+  best_fit$round1$all_particles,
+  best_fit$round2$all_particles,
+  best_fit$round3$all_particles
+)
+
+finalWeights_rio <- all_particles_rio %>%
+  dplyr::mutate(
+    Mov_model_type = movement_code[Mov_model_type],
+    pdetec = pmin(pmax(pdetec_fixed * (obs_total_cases / sim_total_fixed), 0), 1)
+  ) %>%
+  dplyr::select(
+    hometime,
+    mospdeath,
+    betaEnv_mean,
+    betaEnv_cor,
+    Mov_model_type,
+    pdetec,
+    timedevs_R,
+    spacedevs_R,
+    totaldevs
+  )
+
+dim(finalWeights_rio)
+head(finalWeights_rio)
+summary(finalWeights_rio)
+
+#save to rda file
+save(finalWeights_rio, file = "data/finalWeights_rio.rda")
+
+
+finalWeights <- best_fit$round3$all_particles %>%
+  dplyr::mutate(
+    Mov_model_type = movement_code[Mov_model_type],
+    pdetec    = pmin(pmax(pdetec_fixed * (obs_total_cases / sim_total_fixed), 0), 1),
+    totaldevs = 1 - totaldevs / max(totaldevs)
+  ) %>%
+  dplyr::select(hometime, mospdeath, betaEnv_mean, betaEnv_cor,
+                Mov_model_type, pdetec, timedevs_R, spacedevs_R, totaldevs)
+
+stopifnot(nrow(finalWeights) == nrow(best_fit$round3$all_particles),
+          length(unique(finalWeights$Mov_model_type)) == 1)
+save(finalWeights, file = "data/finalWeights.rda")
+```
+
+
+#      Step 5.  b. Post hoc estimation of detection probability (pdetec)
+
+The ABC-SMC fitting above targeted the shape of the outbreak over space and time. Because daily probability of detection (pdetec) was held fixed during SMC fitting, we estimate it post hoc by rescaling simulated epidemic size to match observed totals (following Brady et al 2021 approach). For each accepted particle, we rescale the fixed fitting value pdetec_fixed by the ratio of observed total cases to simulated total detected cases. This rescales the overall epidemic size, but it does not force the monthly peak height or fine-scale month-to-month shape to match exactly. Because all stored simulations in the fitting stage were run with the same fixed value pdetec_fixed, and because the model output used for reported cases is based on detected cases, we assume reported counts scale approximately linearly with pdetec over the small range considered.
+
+```{r apply_pdetec}
+posterior_final_pdetec <- posterior_final %>%
+  dplyr::mutate(
+    pdetec_posthoc_raw = pdetec_fixed * (obs_total_cases / sim_total_fixed),
+    pdetec_posthoc = pmin(pmax(pdetec_posthoc_raw, 0), 1)
+  )
+
+cat("Particles with valid post-hoc pdetec estimates:",
+    sum(is.finite(posterior_final_pdetec$pdetec_posthoc)), "\n")
+cat("Summary of particles with valid post-hoc pdetec estimates: \n")
+summary(posterior_final_pdetec$pdetec_posthoc)
+cat("Summary of particles with valid post-hoc pdetec estimates in finalWeights: \n")
+summary(finalWeights_rio$pdetec)
+```
+
+Post-hoc estimation of detection probability was internally consistent. Among the final accepted particles, daily pdetec estimates were tightly concentrated, well below the fixed fitting value of 0.01. This indicates that the accepted simulations required a lower reporting probability than the fitting value to match the observed total epidemic size.
+
+```{r pdetec_diagnostic_plots, fig.width=12, fig.height=6}
+par(mfrow = c(1, 2))
+
+hist(
+  posterior_final_pdetec$pdetec_posthoc,
+  breaks = 25,
+  main = "Post-hoc estimated daily detection probability",
+  xlab = "pdetec_posthoc"
+)
+
+plot(
+  posterior_final_pdetec$sim_total_fixed,
+  posterior_final_pdetec$pdetec_posthoc,
+  pch = 16,
+  xlab = "Simulated detected total under fixed pdetec",
+  ylab = "Post-hoc estimated pdetec",
+  main = "Post-hoc pdetec versus simulated epidemic size"
+)
+abline(h = median(posterior_final_pdetec$pdetec_posthoc, na.rm = TRUE), lty = 2)
+
+par(mfrow = c(1, 1))
+
+```
+
+```{r summarise_posterior_pdetec}
+check_counts <- posterior_final_pdetec %>%
+  dplyr::transmute(
+    sim_total_fixed,
+    pdetec_posthoc,
+    sim_total_scaled = sim_total_fixed * (pdetec_posthoc / pdetec_fixed),
+    obs_total_cases = obs_total_cases
+  )
+
+summary(check_counts$sim_total_scaled - check_counts$obs_total_cases) # sanity check: should be close to zero
+
+pdetec_summary <- posterior_final_pdetec %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    mean = mean(pdetec_posthoc, na.rm = TRUE),
+    median = median(pdetec_posthoc, na.rm = TRUE),
+    sd = sd(pdetec_posthoc, na.rm = TRUE),
+    min = min(pdetec_posthoc, na.rm = TRUE),
+    q025 = quantile(pdetec_posthoc, 0.025, na.rm = TRUE),
+    q25 = quantile(pdetec_posthoc, 0.25, na.rm = TRUE),
+    q75 = quantile(pdetec_posthoc, 0.75, na.rm = TRUE),
+    q975 = quantile(pdetec_posthoc, 0.975, na.rm = TRUE),
+    max = max(pdetec_posthoc, na.rm = TRUE)
+  )
+
+print(pdetec_summary)
+```
+
+As a sanity check, we verified that post-hoc scaling behaved exactly as intended by recomputing the scaled simulated total case count for each accepted particle. The near-zero difference between scaled simulated totals and observed totals confirms that pdetec is acting purely as a post-hoc scaling parameter and that the rescaling step is internally consistent.
+
+For each accepted posterior particle from the final SMC round, the stored simulation output was used to extract the total number of simulated detected cases under the fixed fitting value `pdetec_fixed`. A post-hoc estimate of `pdetec` was then obtained by rescaling this fixed value in proportion to the ratio of observed to simulated epidemic size over the fitting window. This yielded a posterior distribution of daily detection probabilities conditional on the accepted transmission parameter sets.
+
+#      Step 5.   c. Parameter histograms across rounds
+
+Producing figure corresponding to Brady paper Figure 4, parameter distribution plots across rounds.
+
+```{r prepare_fig4_data}
+fig4_dat <- dplyr::bind_rows(
+  best_fit$round1$all_particles %>% dplyr::mutate(round_label = "Round 1"),
+  best_fit$round2$all_particles %>% dplyr::mutate(round_label = "Round 2"),
+  best_fit$round3$all_particles %>% dplyr::mutate(round_label = "Round 3")
+) %>%
+  dplyr::mutate(
+    pdetec_posthoc = pmin(pmax(pdetec_fixed * (obs_total_cases / sim_total_fixed), 0), 1),
+    log10_pdetec = log10(pdetec_posthoc)
+  )
+
+param_levels <- c( # order parameters for facet_wrap panel order
+  "Movement distance\nscaling", #"Time spent at home",
+  "Daily mosquito mortality\nprobability",
+  "Transmission coefficient\n(mean)",
+  "Transmission coefficient\n(correlation)",
+  "log10\n(Probability of reporting)"
+)
+
+fig4_long <- fig4_dat %>%
+  dplyr::transmute( # relabel parameters for display
+    round_label,
+    `Movement distance\nscaling` = hometime,
+    `Daily mosquito mortality\nprobability` = mospdeath,
+    `Transmission coefficient\n(mean)` = betaEnv_mean,
+    `Transmission coefficient\n(correlation)` = betaEnv_cor,
+    `log10\n(Probability of reporting)` = log10_pdetec
+  ) %>%
+  tidyr::pivot_longer(
+    cols = -round_label,
+    names_to = "parameter",
+    values_to = "value"
+  ) %>%
+  dplyr::mutate(
+    parameter = factor(parameter, levels = param_levels)
+  )
+
+n_per_round <- max(table(fig4_dat$round_label)) # 1000 expected for all particles
+
+# smooth beta prior for mosquito mortality
+mosp_grid <- data.frame(
+  parameter = factor("Daily mosquito mortality\nprobability", levels = param_levels),
+  x = seq(0.001, 0.25, length.out = 500)
+)
+binwidth_mosp <- (0.25 - 0.001) / 10
+mosp_grid$y <- dbeta(mosp_grid$x, shape1 = 11.93, shape2 = 107.4) *
+  n_per_round * binwidth_mosp
+
+# dashed horizontal lines for uniform priors
+uniform_ref <- data.frame(
+  parameter = factor(
+    c("Movement distance\nscaling",
+      "Transmission coefficient\n(mean)",
+      "Transmission coefficient\n(correlation)"),
+    levels = param_levels
+  ),
+  yintercept = rep(n_per_round / 10, 3)
+)
+```
+
+```{r fig4_combined_panel, fig.width=18, fig.height=4}
+param_histograms_plot <- ggplot(fig4_long, aes(x = value, fill = round_label)) +
+  geom_histogram(aes(colour = round_label), position = "identity", alpha = 0.45, bins = 20) +
+  geom_hline(data = uniform_ref, aes(yintercept = yintercept), inherit.aes = FALSE, linetype = "dashed", colour = "black") +
+  geom_line(data = mosp_grid, aes(x = x, y = y), inherit.aes = FALSE, colour = "black", linewidth = 0.6) +
+  facet_wrap(~ parameter, scales = "free_x", nrow = 1, strip.position = "bottom") +
+  scale_colour_manual(values = c("Round 1" = "red", "Round 2" = "green3", "Round 3" = "blue")) +
+  scale_fill_manual(values = c("Round 1" = "red", "Round 2" = "green3", "Round 3" = "blue")) +
+  scale_y_continuous(breaks = seq(0, 625, by = 100)) +
+  coord_cartesian(ylim = c(0, 625)) +
+  labs(title = NULL, x = NULL, y = "Number of particles", fill = "SMC round") +
+  guides(colour = "none") +
+  theme_minimal() +
+  theme(strip.placement = "outside",
+        strip.text = element_text(size = 18),
+        axis.text = element_text(colour = "black", size = 12),
+        axis.ticks = element_line(colour = "black"),
+        axis.line = element_line(colour = "black"),
+        axis.title.y = element_text(size = 18),
+        legend.position = c(0.06, 0.85),
+        legend.background = element_blank(),
+        legend.key = element_blank(),
+        legend.title = element_text(size = 18),
+        legend.text = element_text(size = 18)
+        )
+param_histograms_plot
+ggsave("FIGURE_param_histograms.png", plot = param_histograms_plot, width = 18, height = 4, units = "in", dpi = 300)
+
+```
+
+The SMC rounds progressively concentrated the sampled parameter space. The final radiation particles showed strongest narrowing for the transmission parameters, particularly betaEnv_mean and betaEnv_cor, while the movement distance-scaling parameter remained comparatively weakly identified. The post-hoc reporting probability was concentrated near log10 values corresponding to pdetec ≈ 0.004, consistent with the direct post-hoc scaling estimates.
+
+
+#     Step 5.   d. Lagged spatial spread validation
+
+This section evaluates whether the selected posterior model reproduces the spatial scale of epidemic spread. In Brady et al. (2021, Figure 5), this diagnostic was framed as a transmission-kernel validation. However, the Rio data are aggregated to 500 × 500 m grid cells and monthly time intervals, which do not support direct reconstruction of transmission-event distances.
+
+Instead, we use a weighted all-pairs lagged distance diagnostic. For each pair of consecutive months, all distances are calculated between patches with cases in month t and patches with cases in month t + 1, weighted by the product of the case counts in the two patches. This does not estimate a true transmission tree, but it tests whether posterior simulations reproduce the spatial scale of spread over successive months in patch-aggregated data.
+
+
+```{r posterior_predictive_simulation_helpers}
+simulate_from_posterior <- function(theta,
+                                    timestep,
+                                    fitdat,
+                                    pastdat,
+                                    sgpop,
+                                    unipix,
+                                    pixdistmat,
+                                    stim_vec,
+                                    time_bins_fixed,
+                                    patch_bins_fixed,
+                                    pdetec_fixed = 0.01) {
+
+  pred <- run_particle(
+    theta = theta,
+    timestep = timestep,
+    fitdat = fitdat,
+    pastdat = pastdat,
+    sgpop = sgpop,
+    unipix = unipix,
+    pixdistmat = pixdistmat,
+    steprun = n_days,
+    stim_vec = stim_vec,
+    time_bins_fixed = time_bins_fixed,
+    patch_bins_fixed = patch_bins_fixed,
+    pdetec_fixed = pdetec_fixed
+  )
+
+  if (is.null(pred)) return(NULL)
+  if (is.atomic(pred) && any(is.na(pred))) return(NULL)
+
+  if (sum(pred$sim_time_counts) <= 0 || sum(pred$sim_space_counts) <= 0) return(NULL)
+
+  list(
+    sim = pred$sim,
+    time_rel = pred$sim_time_counts / sum(pred$sim_time_counts),
+    space_rel = pred$sim_space_counts / sum(pred$sim_space_counts)
+  )
+}
+
+sample_posterior_thetas <- function(posterior_df, n_draws = 20) {
+  idx <- sample(seq_len(nrow(posterior_df)), min(n_draws, nrow(posterior_df)), replace = FALSE)
+
+  lapply(idx, function(i) {
+    list(
+      hometime = posterior_df$hometime[i],
+      mospdeath = posterior_df$mospdeath[i],
+      betaEnv_mean = posterior_df$betaEnv_mean[i],
+      betaEnv_cor = posterior_df$betaEnv_cor[i],
+      Mov_model_type = posterior_df$Mov_model_type[i]
+    )
+  })
+}
+```
+
+Posterior predictive simulations were generated by sampling parameter sets from the final accepted posterior particles and rerunning the simulator. These simulations are used only for validation plots and are not part of the ABC-SMC fitting procedure.
+
+```{r posterior_predictive_simulation_runs}
+set.seed(1)
+
+posterior_thetas <- sample_posterior_thetas(posterior_final, n_draws = 20)
+
+posterior_preds <- lapply(
+  posterior_thetas,
+  simulate_from_posterior,
+  timestep = timestep,
+  fitdat = fitdat,
+  pastdat = pastdat,
+  sgpop = riopop,
+  unipix = unipix,
+  pixdistmat = pixdistmat,
+  stim_vec = stim_vec,
+  time_bins_fixed = time_bins_fixed,
+  patch_bins_fixed = patch_bins_fixed
+)
+
+posterior_preds <- posterior_preds[!sapply(posterior_preds, is.null)]
+if (length(posterior_preds) == 0) {
+  stop(
+    "No valid posterior predictive simulations were generated.\n",
+    "Possible causes:\n",
+    "- All run_particle() calls returned NULL or NA\n",
+    "- Simulated outbreaks had zero cases (filtered out)\n",
+    "- Numerical instability in the simulator\n",
+    "Try:\n",
+    "- Increasing n_draws\n",
+    "- Checking posterior parameter ranges\n",
+    "- Running run_particle() manually for debugging"
+  )
+}
+```
+
+```{r lagged_spatial_spread_helpers}
+get_month_patch_cases <- function(case_dat, unipix) {
+  case_dat %>%
+    dplyr::left_join(unipix %>% dplyr::transmute(patchID, x, y), by = "patchID") %>%
+    dplyr::group_by(t = month_index, patchID, x, y) %>%
+    dplyr::summarise(Number_of_cases = sum(Number_of_cases), .groups = "drop") %>%
+    dplyr::filter(Number_of_cases > 0)
+}
+
+compute_lagged_all_pair_distances <- function(case_patch_dat, lag = 1) {
+  times <- sort(unique(case_patch_dat$t))
+  out <- lapply(times[(times + lag) %in% times], function(tt) {
+    cur <- case_patch_dat %>% dplyr::filter(t == tt)
+    nxt <- case_patch_dat %>% dplyr::filter(t == tt + lag)
+    dmat <- geosphere::distm(as.matrix(cur[, c("x", "y")]), as.matrix(nxt[, c("x", "y")]))
+    pair_df <- expand.grid(from = seq_len(nrow(cur)), to = seq_len(nrow(nxt)))
+    pair_df$distance_km <- dmat[cbind(pair_df$from, pair_df$to)] / 1000
+    pair_df$weight <- cur$Number_of_cases[pair_df$from] * nxt$Number_of_cases[pair_df$to]
+    pair_df$t_from <- tt
+    pair_df
+  })
+  dplyr::bind_rows(out)
+}
+```
+
+```{r observed_lagged_spatial_distances}
+obs_cases_xy <- get_month_patch_cases(obs_monthly_patch, unipix)
+obs_disp_all <- compute_lagged_all_pair_distances(obs_cases_xy, lag = 1) %>%
+  dplyr::mutate(source = "Observed")
+summary(obs_disp_all$distance_km)
+```
+
+The observed weighted all-pairs lagged distances span most of the modelled Rio patch system and confirms that the spatial validation data contain long-distance relationships between active patches.
+
+```{r extract_simulated_month_patch_cases}
+extract_sim_month_patch <- function(sim_obj, unipix) {
+  newD_mat <- do.call(rbind, lapply(sim_obj[[2]], function(df) df$newD))
+  monthly <- rowsum(newD_mat, group = day_month, reorder = TRUE)  # months x patches
+  data.frame(t = rep(seq_len(nrow(monthly)), times = ncol(monthly)),
+             patchID = rep(unipix$patchID, each = nrow(monthly)),
+             Number_of_cases = as.vector(monthly)) %>%
+    dplyr::filter(Number_of_cases > 0) %>%
+    dplyr::left_join(unipix %>% dplyr::transmute(patchID, x, y), by = "patchID")
+}
+```
+
+```{r posterior_lagged_spatial_distances}
+sim_disp_list <- lapply(seq_along(posterior_preds), function(i) {
+  sim_long <- extract_sim_month_patch(posterior_preds[[i]]$sim, unipix)
+  out <- compute_lagged_all_pair_distances(sim_long, lag = 1)
+
+  if (nrow(out) > 0) out$sim_id <- i
+  out
+})
+
+sim_disp_all <- dplyr::bind_rows(sim_disp_list) %>%
+  dplyr::mutate(source = "Posterior predictive")
+
+summary(sim_disp_all$distance_km)
+```
+
+```{r lagged_distance_bin_summaries_1km}
+make_distance_bins_1km <- function(disp_df, source_label) {
+  disp_df %>%
+    dplyr::mutate(
+      bin = cut(
+        distance_km,
+        breaks = c(seq(0, 20, by = 1), Inf),
+        include.lowest = TRUE,
+        right = FALSE,
+        labels = c(
+          paste0(0:19, "-", 1:20),
+          "over 20"
+        )
+      )
+    ) %>%
+    dplyr::group_by(bin) %>%
+    dplyr::summarise(weight = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::mutate(
+      pct_cases = 100 * weight / sum(weight),
+      source = source_label
+    )
+}
+
+obs_distance_binned_1km <- make_distance_bins_1km(obs_disp_all, "Observed")
+
+sim_distance_binned_list_1km <- lapply(split(sim_disp_all, sim_disp_all$sim_id), function(df) {
+  make_distance_bins_1km(df, "Posterior predictive") %>%
+    dplyr::select(bin, pct_cases)
+})
+
+sim_distance_binned_1km <- dplyr::bind_rows(sim_distance_binned_list_1km, .id = "sim_id") %>%
+  dplyr::group_by(bin) %>%
+  dplyr::summarise(
+    pct_cases = median(pct_cases, na.rm = TRUE),
+    q025 = quantile(pct_cases, 0.025, na.rm = TRUE),
+    q975 = quantile(pct_cases, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(source = "Posterior predictive")
+
+plot_dat_distance_1km <- dplyr::bind_rows(
+  obs_distance_binned_1km %>%
+    dplyr::mutate(q025 = NA_real_, q975 = NA_real_),
+  sim_distance_binned_1km
+)
+
+plot_dat_distance_1km$bin <- factor(
+  plot_dat_distance_1km$bin,
+  levels = c(paste0(0:19, "-", 1:20), "over 20")
+)
+```
+
+#### Supplementary diagnostic: binned lagged distances
+
+Shows the same lagged patch-pair distances as the cumulative distribution below, grouped into 1 km bins on a log scale, which makes differences at longer distances easier to see. Not used in the manuscript.
+
+```{r lagged_spatial_spread_validation_1km, fig.width=11, fig.height=6}
+lagged_spread_plot <- ggplot() +
+  geom_line(data = sim_distance_binned_1km,
+            aes(x = as.numeric(factor(bin, levels = levels(plot_dat_distance_1km$bin))), y = pct_cases, colour = "Posterior predictive median"),
+            linewidth = 1, linetype = "dashed") +
+  geom_point(data = obs_distance_binned_1km,
+             aes(x = as.numeric(factor(bin, levels = levels(plot_dat_distance_1km$bin))), y = pct_cases, colour = "Observed"),
+             size = 2) +
+  geom_line(data = obs_distance_binned_1km,
+            aes(x = as.numeric(factor(bin, levels = levels(plot_dat_distance_1km$bin))), y = pct_cases, colour = "Observed"),
+            linewidth = 1) +
+  scale_x_continuous(breaks = seq_along(levels(plot_dat_distance_1km$bin)),
+                     labels = levels(plot_dat_distance_1km$bin)) +
+  scale_y_log10(breaks = c(0.001, 0.01, 0.1, 1, 10, 100),
+                labels = c("0.001 %", "0.01 %", "0.1 %", "1 %", "10 %", "100 %")) +
+  scale_colour_manual(values = c("Observed" = "black",
+                                 "Posterior predictive median" = "grey40")) +
+  labs(title = NULL,
+       x = "Lagged patch-pair distance over one month (km)",
+       y = "Percentage of weighted patch-pairs",
+       colour = "Source") +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_text(size = 12),
+    axis.text.x = element_text(colour = "black", size = 9, angle = 45, hjust = 1),
+    axis.text.y = element_text(colour = "black", size = 10),
+    axis.ticks = element_line(colour = "black"),
+    axis.line = element_line(colour = "black"),
+    legend.position = c(0.18, 0.18),
+    legend.background = element_blank(),
+    legend.key = element_blank(),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 12)
+  )
+
+lagged_spread_plot
+
+ggsave("FIGURE_lagged_spatial_spread_validation.png", plot = lagged_spread_plot, width = 11, height = 6, dpi = 300)
+```
+
+To assess whether the fitted model reproduced the spatial scale of epidemic spread, we compared the cumulative distribution of lagged pairwise distances between patches reporting dengue cases in observed and posterior-predictive simulations. Because the public dengue surveillance dataset was spatially aggregated to 500 × 500 m patches, direct reconstruction of infector–infectee transmission distances was not possible. Instead, we used all weighted patch-pair distances between cases separated by a one month lag as a practical proxy for transmission generation distance. The shaded region represents the 95% posterior predictive interval across simulations and the dashed line the posterior predictive median.
+
+```{r lagged_spatial_spread_validation_cdf, fig.width=9, fig.height=6}
+weighted_ecdf <- function(x, w) {
+  o <- order(x)
+  x <- x[o]
+  w <- w[o]
+  data.frame(
+    distance_km = x,
+    cdf = cumsum(w) / sum(w)
+  )
+}
+
+obs_cdf <- weighted_ecdf(
+  obs_disp_all$distance_km,
+  obs_disp_all$weight
+) %>%
+  dplyr::mutate(source = "Observed")
+
+sim_cdf_list <- lapply(split(sim_disp_all, sim_disp_all$sim_id), function(df) {
+  weighted_ecdf(df$distance_km, df$weight)
+})
+
+sim_cdf_summary <- dplyr::bind_rows(sim_cdf_list, .id = "sim_id") %>%
+  dplyr::mutate(distance_bin = round(distance_km, 1)) %>%
+  dplyr::group_by(distance_bin) %>%
+  dplyr::summarise(
+    median_cdf = median(cdf, na.rm = TRUE),
+    q025 = quantile(cdf, 0.025, na.rm = TRUE),
+    q975 = quantile(cdf, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+lagged_spread_cdf_plot <- ggplot() +
+  geom_ribbon(
+    data = sim_cdf_summary,
+    aes(x = distance_bin, ymin = q025, ymax = q975),
+    fill = "grey70",
+    alpha = 0.35
+  ) +
+  geom_line(
+    data = sim_cdf_summary,
+    aes(x = distance_bin, y = median_cdf, linetype = "Estimated\n(posterior median)"),
+    colour = "black",
+    linewidth = 1
+  ) +
+  geom_line(
+    data = obs_cdf,
+    aes(x = distance_km, y = cdf, linetype = "Reported"),
+    colour = "black",
+    linewidth = 1
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "Reported" = "solid",
+      "Estimated\n(posterior median)" = "dashed"
+    )
+  ) +
+  labs(
+    title = NULL,
+    x = "Lagged patch-pair distance (km)",
+    y = "Cumulative probability",
+    linetype = NULL
+  ) +
+  theme_bw() +
+  theme(
+    axis.text = element_text(colour = "black", size = 12),
+    axis.title = element_text(size = 18),
+    legend.position = c(0.825, 0.1),
+    legend.background = element_blank(),
+    legend.key = element_blank(),
+    legend.text = element_text(size = 18)
+  )
+
+lagged_spread_cdf_plot
+
+ggsave(
+  "FIGURE_lagged_spatial_spread_validation_cdf.png",
+  lagged_spread_cdf_plot,
+  width = 9,
+  height = 5.5,
+  units = "in",
+  dpi = 300
+)
+```
+
+The fitted model reproduced the spatial scale of lagged spread at short distances: observed and posterior predictive cumulative distributions were closely aligned below approximately 4 km. At longer distances, the model underestimated the frequency of spread, with simulated cases occurring closer together than observed. This suggests that the selected movement model captures local spatial dynamics but underrepresents longer-distance spread across the city.
+
+#       Step 6. a. Spatiotemporal fit validation
+
+Spatial and temporal fit is assessed by comparing the observed temporal bin distribution with posterior predictive simulations from the final accepted particles.
+
+```{r temporal_fit_validation, fig.width=18, fig.height=6}
+par(mfrow = c(1, 2))
+
+plot(obs_time_rel, type = "b",
+     ylim = c(0, max(obs_time_rel)),
+     main = paste("Temporal fit validation -", best_model_name),
+     xlab = "Month",
+     ylab = "Relative frequency")
+
+for (i in seq_along(posterior_preds)) {
+  lines(posterior_preds[[i]]$time_rel, col = rgb(1, 0, 0, 0.25))
+}
+
+legend("topleft",
+       legend = c("Observed", "Posterior predictive"),
+       lty = c(1, 1),
+       col = c("black", rgb(1, 0, 0, 0.5)),
+       bty = "n")
+
+plot(obs_space_rel, type = "b",
+     ylim = c(0, max(obs_space_rel)),
+     main = paste("Spatial fit validation -", best_model_name),
+     xlab = "Spatial bin",
+     ylab = "Relative frequency",
+     xaxt = "n")
+axis(1, at = seq_len(n_space_bins), labels = levels(factor(cell_info$zone)))
+
+for (i in seq_along(posterior_preds)) {
+  lines(posterior_preds[[i]]$space_rel, col = rgb(0, 0, 1, 0.25))
+}
+
+legend("topleft",
+       legend = c("Observed", "Posterior predictive"),
+       lty = c(1, 1),
+       col = c("black", rgb(0, 0, 1, 0.5)),
+       bty = "n")
+
+par(mfrow = c(1, 1))
+```
+
+Posterior predictive simulations from the selected model reproduced the broad temporal distribution well: the observed epidemic mass was concentrated in months 6–7 (April, May) and the posterior predictions captured this peak period. Spatial fit was weaker. The model tended to overpredict some spatial bins and underpredict others, indicating that the selected movement kernel and spatial summaries captured epidemic timing better than fine-scale spatial accumulation.
+
+For a more compact quantitative summary, here are computed posterior medians and intervals:
+```{r posterior_summary_bins}
+time_mat <- do.call(rbind, lapply(posterior_preds, `[[`, "time_rel"))
+space_mat <- do.call(rbind, lapply(posterior_preds, `[[`, "space_rel"))
+
+time_q <- apply(time_mat, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)
+space_q <- apply(space_mat, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)
+
+time_q
+space_q
+```
+
+Posterior predictive coverage with uncertainty bands for temporal bins.
+```{r quant_extra_summary, fig.width=18, fig.height=6, warning = FALSE}
+time_mat <- do.call(rbind, lapply(posterior_preds, `[[`, "time_rel"))
+
+time_summary <- data.frame(
+  bin = 1:ncol(time_mat),
+  median = apply(time_mat, 2, median),
+  low = apply(time_mat, 2, quantile, 0.025),
+  high = apply(time_mat, 2, quantile, 0.975)
+)
+
+ggplot(time_summary, aes(x = bin)) +
+  geom_ribbon(aes(ymin = low,ymax = high, fill = "95%CI\nposterior\npredictive\ncoverage"), alpha = 0.3) +
+  geom_line(aes(y = median), colour = "tomato4", linetype = "dashed") +
+  geom_line(aes(y = obs_time_rel), colour = "black") +
+  scale_fill_manual(values = c("95%CI\nposterior\npredictive\ncoverage" = "tomato"), name = NULL) +
+  labs(title = NULL, x = "Month", y = "Relative frequency") +
+  theme_minimal()
+```
+
+The temporal posterior predictive interval contained about half of the observed monthly proportions. Observed proportions fell outside the interval mainly at the start of the season, in May, when the observed epidemic was more concentrated than simulated, and in the months immediately after the peak, when observed cases declined faster than simulated. This indicates that the model captures the broad seasonal profile but not the sharpness of the observed peak.
+
+#       Step 6.  b. Epidemic time series validation
+
+```{r scale_monthly_simulations_with_pdetec}
+scale_monthly_curve_from_saved <- function(monthly_counts, pdetec_fixed, pdetec_posthoc) {
+  scale_factor <- pdetec_posthoc / pdetec_fixed
+  data.frame(month_index = seq_along(monthly_counts),
+             cases = monthly_counts,
+             cases_scaled = monthly_counts * scale_factor)
+}
+
+scaled_monthly_curves <- Map(
+  scale_monthly_curve_from_saved,
+  monthly_counts = posterior_final_pdetec$sim_monthly_fixed,
+  pdetec_posthoc = posterior_final_pdetec$pdetec_posthoc,
+  MoreArgs = list(pdetec_fixed = pdetec_fixed)
+)
+
+scaled_monthly_long <- dplyr::bind_rows(lapply(seq_along(scaled_monthly_curves), function(i) {
+  cur <- scaled_monthly_curves[[i]]; cur$particle_id <- i; cur
+}))
+
+scaled_monthly_summary <- scaled_monthly_long %>%
+  dplyr::group_by(month_index) %>%
+  dplyr::summarise(median_cases = median(cases_scaled, na.rm = TRUE),
+                   lower_cases  = quantile(cases_scaled, 0.025, na.rm = TRUE),
+                   upper_cases  = quantile(cases_scaled, 0.975, na.rm = TRUE),
+                   .groups = "drop")
+```
+
+```{r epidemic_curve_validation, fig.width=10, fig.height=6}
+plot(
+  obs_monthly$month_index, obs_monthly$cases,
+  type = "b", lwd = 2, col = "black", xaxt = "n",
+  xlab = "Month", ylab = "Reported cases",
+  main = paste("Epidemic curve validation -", best_model_name),
+  ylim = c(0, max(obs_monthly$cases, scaled_monthly_summary$upper_cases, na.rm = TRUE))
+)
+axis(1, at = seq_len(n_months), labels = format(month_levels, "%b %y"))
+
+# RAW posterior curves (fixed pdetec, so not on the reported-case scale)
+for (i in seq_along(posterior_preds)) {
+  sim_m <- extract_sim_monthly_total(posterior_preds[[i]]$sim)
+  if (is.null(sim_m)) next
+  lines(sim_m$month_index, sim_m$cases, col = rgb(1, 0, 0, 0.12))
+}
+
+# SCALED posterior curves
+for (i in seq_along(scaled_monthly_curves)) {
+  cur <- scaled_monthly_curves[[i]]
+  if (is.null(cur)) next
+  lines(cur$month_index, cur$cases_scaled, col = rgb(0, 0, 1, 0.18))
+}
+
+# scaled posterior median
+lines(scaled_monthly_summary$month_index, scaled_monthly_summary$median_cases,
+      lwd = 2, lty = 2, col = "black")
+
+legend(
+  "topright",
+  legend = c("Observed", "Posterior raw", "Posterior scaled", "Scaled posterior median"),
+  lty = c(1, 1, 1, 2),
+  lwd = c(2, 1, 1, 2),
+  col = c("black", rgb(1, 0, 0, 0.4), rgb(0, 0, 1, 0.5), "black"),
+  bty = "n"
+)
+```
+
+The raw posterior simulations overestimated absolute case numbers because pdetec was fixed during SMC fitting. After post-hoc scaling of pdetec, the posterior curves were brought onto the observed reporting scale. The scaled median reproduced the overall rise and fall of the epidemic, but the observed curve remained sharper than the posterior ensemble, especially as the simulated peak was around one month early.
+
+
+```{r epidemic_curve_validation_manuscript, fig.width=9, fig.height=5.5}
+epidemic_curve_plot <- ggplot() +
+  geom_line(
+    data = scaled_monthly_long,
+    aes(x = month_index, y = cases_scaled, group = particle_id),
+    colour = "grey60", alpha = 0.18, linewidth = 0.3
+  ) +
+  geom_line(
+    data = obs_monthly,
+    aes(x = month_index, y = cases, linetype = "Reported"),
+    colour = "black", linewidth = 0.8
+  ) +
+  geom_point(
+    data = obs_monthly,
+    aes(x = month_index, y = cases),
+    colour = "black", size = 1.8
+  ) +
+  geom_line(
+    data = scaled_monthly_summary,
+    aes(x = month_index, y = median_cases, linetype = "Estimated\n(posterior median)"),
+    colour = "black", linewidth = 0.8
+  ) +
+  scale_linetype_manual(
+    values = c("Reported" = "solid",
+               "Estimated\n(posterior median)" = "dashed")
+  ) +
+  scale_x_continuous(
+    breaks = seq_len(n_months),
+    labels = format(month_levels, "%b\n%Y")
+  ) +
+  labs(x = NULL, y = "Cases", linetype = NULL) +
+  theme_bw() +
+  theme(
+    legend.position = c(0.78, 0.92),
+    legend.background = element_blank(),
+    legend.key = element_blank(),
+    legend.text = element_text(size = 18),
+    axis.text = element_text(colour = "black", size = 12),
+    axis.title = element_text(size = 18),
+    panel.grid.minor = element_line(colour = "grey95"),
+    panel.grid.major = element_line(colour = "grey90"),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+epidemic_curve_plot
+
+ggsave("FIGURE_epidemic_curve_validation.png", epidemic_curve_plot, width = 9, height = 5.5, units = "in", dpi = 300)
+```
+
+
+```{r epidemic_curve_validation_scaled, fig.width=10, fig.height=6}
+obs_vs_scaled <- obs_monthly %>%
+  dplyr::left_join(
+    scaled_monthly_summary %>%
+      dplyr::rename(
+        lower = lower_cases,
+        median = median_cases,
+        upper = upper_cases
+      ),
+    by = "month_index"
+  ) %>%
+  dplyr::mutate(in_95 = cases >= lower & cases <= upper)
+
+mean(obs_vs_scaled$in_95, na.rm = TRUE)
+obs_vs_scaled
+```
+
+After post-hoc scaling, 50% of observed monthly counts fell within the posterior 95% interval. Coverage was poorest during the early growth phase and around sharper changes in the observed epidemic curve. This indicates that although the model captures the broad annual epidemic profile, it remains underdispersed at the weekly scale and does not fully reproduce the abruptness of observed epidemic growth and decline.
+
+#       Step 6.   c. Other validation metrics
+
+#### Joint error structure (temporal vs spatial trade-off)
+
+```{r joint_error_structure, fig.width=10, fig.height=6}
+ggplot(finalWeights_rio, aes(x = timedevs_R, y = spacedevs_R)) +
+  geom_point(alpha = 0.3) +
+  theme_minimal()
+```
+
+```{r temporal_fit_distance, fig.width=12, fig.height=6, warning = FALSE}
+plot_dat <- dplyr::bind_rows(
+  posterior_final %>%
+    dplyr::transmute(
+      distance = timedevs_R,
+      panel = "Temporal fit distance"
+    ),
+  posterior_final %>%
+    dplyr::transmute(
+      distance = spacedevs_R,
+      panel = "Spatial fit distance"
+    )
+)
+
+ggplot(plot_dat, aes(x = distance)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~panel, ncol = 2, scales = "free_x") +
+  labs(
+    x = "Distance",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+Temporal and spatial errors showed different behaviour. Among the final accepted particles, the median spatial distance was larger than the median temporal distance, indicating that total discrepancy was dominated by spatial mismatch between release zones.
+
+#### Posterior predictive coverage
+
+```{r posterior_predictive_coverage}
+obs_time_rel >= time_q["2.5%", ] & obs_time_rel <= time_q["97.5%", ]
+```
+
+The temporal posterior predictive interval contained 6 of 12 observed monthly proportions. Observed proportions fell outside the interval at the start of the season (November–December, when observed cases were proportionally higher than simulated, and February, when they were lower), at the peak in May, when the observed epidemic was more concentrated than simulated, and in the two months after the peak (June–July), when observed cases declined faster than simulated. This indicates that the model captures the broad seasonal profile but not the sharpness of the observed peak.
+
+```{r posterior_temporalvdspatial_improvement}
+posterior_final %>%
+  dplyr::summarise(
+    mean_time = mean(timedevs_R),
+    mean_space = mean(spacedevs_R),
+    median_time = median(timedevs_R),
+    median_space = median(spacedevs_R)
+  )
+```
+
+
+#### Distribution of fit distances across SMC rounds
+
+```{r distribution_fit_distances, fig.width=10, fig.height=6}
+ggplot(round_summary, aes(x = totaldevs, fill = factor(round))) +
+  geom_histogram(bins = 40, alpha = 0.5, position = "identity") +
+  labs(x = "Total distance", fill = "Round") +
+  theme_minimal()
+```
+
+Shows clear tightening across rounds, shifting left, consistent with effective SMC convergence.
+
+# Overall model refit statement
+
+The refit converged successfully under the ABC-SMC objective. All three movement models completed the same three-round fitting procedure, and the radiation movement model achieved the lowest final median distance, although its advantage over the exponential model was modest. The selected radiation model showed stable stochastic evaluation, a clear reduction in total distance across SMC rounds, and evidence of parameter learning, especially for the transmission parameters, while the movement distance-scaling parameter remained weakly identified. Post-hoc scaling estimated a daily reporting probability of approximately 0.004 among the final accepted particles.
+
+Model validation suggests that the refit captures the broad seasonal profile of the Rio outbreak, but with three limitations. First, simulated epidemics peaked about one month earlier than observed and were less sharply peaked, so that 6 of 12 observed monthly proportions fell within the posterior predictive interval. Second, the model reproduced the spatial scale of spread at short distances but underestimated longer-distance spread. Third, spatial discrepancy between release zones remained larger than temporal discrepancy. Overall, the refit is suitable for reproducing the general size, timing and spatial scale of the outbreak and for comparing movement models, but it should not be interpreted as resolving fine-scale transmission pathways or the exact shape of the epidemic curve.
+
+
