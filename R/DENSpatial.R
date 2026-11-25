@@ -1,8 +1,8 @@
 #' Run a single realisation of the spatial dengue model
 #'
 #' Main wrapper function for running a single realisation of the dengue spatial model, may take a while to run depending on specification
-#' @param weekdates Two element vector of the start and end weeks of the simulation over which the model will be evaluated over
-#' @param fitdat Data frame of the locations, numbers and timings (in weeks) of cases to fit the model to, see ?sgdat
+#' @param timestep Two-element vector of the first and last time steps of the case data (any resolution, e.g. weeks or months)
+#' @param fitdat Data frame of the locations, numbers and timings of cases to fit the model to, see ?sgdat. The column Week holds the time-step index at any temporal resolution (e.g. week or month); rows with Week == timestep[1] are used to seed initial infections.
 #' @param pastdat Data frame of the locations, numbers and timings (in weeks) of all cases in the dataset (is used to generate the starting immunity profile), see ?sgdat
 #' @param sgpop Raster containing the number of people residing in each patch, see ?sgpop
 #' @param unipix Universal pixel lookup table, see ?make.unipix
@@ -23,16 +23,16 @@
 #' unipix <- make.unipix(sgpop)
 #' pixdistmat <- distm(cbind(unipix$x, unipix$y))
 #' sgdat <- data.frame(sgdat, patchID = apply(cbind(sgdat[, 3:2]), 1, pix.id.find, unipix))
-#' weekdates <- c(40, 92)
+#' timestep <- c(40, 92)
 #' # model run with default parameters
-#' denmod_sim <- DEN.spatial(weekdates, sgdat, sgdat, sgpop, unipix, pixdistmat, 365)
+#' denmod_sim <- DEN.spatial(timestep, sgdat, sgdat, sgpop, unipix, pixdistmat, 365)
 #' # model run with reactive drug deployment
 #' drugtreat = data.frame(EffCoverage = 0.9, Duration = 30, Radius = 1000, Delay = 0)
-#' denmod_sim_drugs <- DEN.spatial(weekdates, sgdat, unipix, pixdistmat, 365, paramsList = list(drugtreat = drugtreat))
+#' denmod_sim_drugs <- DEN.spatial(timestep, sgdat, unipix, pixdistmat, 365, paramsList = list(drugtreat = drugtreat))
 
 
 
-DEN.spatial <- function(weekdates,
+DEN.spatial <- function(timestep,
                         fitdat,
                         pastdat,
                         sgpop,
@@ -108,7 +108,7 @@ DEN.spatial <- function(weekdates,
   }
   mospdeath = paramsList$mospdeath
 
-  
+
   if(!("stim" %in% names(paramsList))){
     paramsList = c(stim = list(as.vector(sero)[unipix$pixID]),
                    paramsList)
@@ -123,6 +123,17 @@ DEN.spatial <- function(weekdates,
                    paramsList)
   }
   betaEnv = paramsList$betaEnv
+  # Optional proportional reduction in betaEnv, e.g. Wolbachia effect
+  # betaEnv_reduction = 0.38 means reduce betaEnv by 38%
+  if("betaEnv_reduction" %in% names(paramsList)){
+    if(length(paramsList$betaEnv_reduction) == 1){
+      betaEnv <- betaEnv * (1 - paramsList$betaEnv_reduction)
+    } else if(length(paramsList$betaEnv_reduction) == length(betaEnv)){
+      betaEnv <- betaEnv * (1 - paramsList$betaEnv_reduction)
+    } else {
+      stop("betaEnv_reduction must be either length 1 or length nrow(unipix).")
+    }
+  }
 
   if(!("drugtreat" %in% names(paramsList))){
     paramsList = c(drugtreat = list(data.frame(EffCoverage = 0,
@@ -148,6 +159,12 @@ DEN.spatial <- function(weekdates,
   vectreat_Rad = as.numeric(paramsList$vectreat[3])
   vectreat_Del = as.numeric(paramsList$vectreat[4])
 
+  # Optional distance-dependent CATI coverage (index patch, edge and corner neighbours)
+  cov_cols <- c("Cov_index", "Cov_edge", "Cov_corner")
+  vectreat_Cov <- if (all(cov_cols %in% names(paramsList$vectreat))) {
+    as.numeric(paramsList$vectreat[cov_cols])
+  } else NULL
+
   if(!("StopCriteria" %in% names(paramsList))){
     paramsList = c(StopCriteria = sum(unipix$pop),paramsList)
   }
@@ -155,7 +172,7 @@ DEN.spatial <- function(weekdates,
 
   # !!!no longer used
   #if(!("startTable" %in% names(paramsList))){
-  #  paramsList = c(startTable = list(case.backtrack.time(casedat, weekdates[1], unipix, stim, betaEnv, mospdeath, hometime)),
+  #  paramsList = c(startTable = list(case.backtrack.time(casedat, timestep[1], unipix, stim, betaEnv, mospdeath, hometime)),
   #                 paramsList)
   #}
   #startTable = paramsList$startTable
@@ -206,8 +223,8 @@ DEN.spatial <- function(weekdates,
 
   ## Initial conditions:
   # 01 calculate the total numbers of various different states at the begining
-  start_sing = data.frame(Number = fitdat$Number_of_cases[fitdat$Week == weekdates[1]],
-                            Location = fitdat$patchID[fitdat$Week == weekdates[1]])
+  start_sing = data.frame(Number = fitdat$Number_of_cases[fitdat$Week == timestep[1]],
+                            Location = fitdat$patchID[fitdat$Week == timestep[1]])
   start_sing = aggregate(start_sing$Number, list(start_sing$Location), sum)
   start_sing = data.frame(Number_I = start_sing$x,
                           Number_trueI = round(start_sing$x / (8 * pdetec), 0) - start_sing$x, # need to times pdetec by 8 to go from daily value to value over all symptomatic days
@@ -289,6 +306,7 @@ DEN.spatial <- function(weekdates,
   # tracks which patches have been treated at each timestep
   treatlog_drug <- list()
   treatlog_vec <- list()
+  treatlog_veccov <- list()
 
   # add detected state
   sing_D <- matrix(0, nrow = nrow(sing_I), ncol = ncol(sing_I))
@@ -334,18 +352,46 @@ DEN.spatial <- function(weekdates,
       }else{treatlog_drug[[i]] = NA}
 
       # Vector control
+#      if(sum(!is.na(Dspots2)) > 0){
+#        # assign to treatment log
+#        treatlog_vec[[i]] = Dspots2
+#
+#        # assign drugs (+/- delay between patient detection and local area visit)
+#        if(i > vectreat_Del){ # can only start if vectreat_Del- days in
+#          scheduleday = i - vectreat_Del
+#          if(!all(is.na(treatlog_vec[[scheduleday]]))){
+#            mosDeathProbLocal[treatlog_vec[[scheduleday]]] <- vectreat_Eff
+#          }
+#        }
+#      }else{treatlog_vec[[i]] = NA}
+
+      # Vector control - now assigning proportional coverage to neighbouring patches
       if(sum(!is.na(Dspots2)) > 0){
         # assign to treatment log
         treatlog_vec[[i]] = Dspots2
 
-        # assign drugs (+/- delay between patient detection and local area visit)
+        # patch-level coverage by distance to nearest newly detected case
+        if(!is.null(vectreat_Cov)){
+          case_patches <- which(colSums(newsingDs) > 0)
+          dmin <- apply(pixdistmat[case_patches, , drop = FALSE], 2, min)
+          treatlog_veccov[[i]] <- ifelse(dmin < 250, vectreat_Cov[1],       # index patch
+                                         ifelse(dmin < 600, vectreat_Cov[2],       # edge neighbours (~500 m)
+                                                ifelse(dmin < 800, vectreat_Cov[3], 0)))  # corner neighbours (~707 m)
+        }
+
+        # assign vector control (+/- delay between patient detection and local area visit)
         if(i > vectreat_Del){ # can only start if vectreat_Del- days in
           scheduleday = i - vectreat_Del
           if(!all(is.na(treatlog_vec[[scheduleday]]))){
-            mosDeathProbLocal[treatlog_vec[[scheduleday]]] <- vectreat_Eff
+            if(is.null(vectreat_Cov)){
+              mosDeathProbLocal[treatlog_vec[[scheduleday]]] <- vectreat_Eff   # original behaviour
+            } else {
+              mosDeathProbLocal <- vectreat_Eff * treatlog_veccov[[scheduleday]]
+            }
           }
         }
       }else{treatlog_vec[[i]] = NA}
+
     }else{
       Dspots1 = NA
       Dspots2 = NA
@@ -367,7 +413,7 @@ DEN.spatial <- function(weekdates,
     # MOSQUITO
     #(S never changes so not here)
     # mos E
-    mos_E_IO <- SpatialDengue::multinom(list(list(mos_S, mosInfProb),
+    mos_E_IO <- multinom(list(list(mos_S, mosInfProb),
                               list(mos_E, func_EIP),
                               list(mos_E,  mospdeath),
                               list(mos_E, mosDeathProbLocal)),
@@ -379,14 +425,14 @@ DEN.spatial <- function(weekdates,
     mos_E = transition(base = mos_E,  plus = mos_E_IO[[1]], minus = (mos_E_IO[[2]] + mos_E_IO[[3]] + mos_E_IO[[4]]))
 
     # mos_I
-    mos_I_O <- SpatialDengue::multinom(list(list(mos_I,  mospdeath),
+    mos_I_O <- multinom(list(list(mos_I,  mospdeath),
                              list(mos_I, mosDeathProbLocal)),
                         type = "mos_I")
     mos_I = mos_I + colSums(mos_E_IO[[2]]) - mos_I_O[[1]] - mos_I_O[[2]] + extraMosE_I
 
     # HUMAN
     # sing_S
-    sing_S_IO <- SpatialDengue::multinom(list(list(sing_S, humInfProb),
+    sing_S_IO <- multinom(list(list(sing_S, humInfProb),
                                list(sing_S, humDrugTreatProbLocal),
                                list(sing_Rt,  function(times) pnorm(times, drugtreat_Dur, 0))),
                           type = "sing_S")
@@ -417,11 +463,36 @@ DEN.spatial <- function(weekdates,
     newsignDopts <- cbind(as.vector(sing_I2), rep(func_IIP(1:nrow(sing_I2)), ncol(sing_I2)) * pdetec)
     poscells <- newsignDopts[, 1] > 0
     newsingDs = rep(0, length(newsignDopts[, 1]))
+    #if(sum(poscells) > 0){
+    #  if(sum(poscells) == 1){newsingDs[poscells] = rbinom(1, newsignDopts[poscells, 1], newsignDopts[poscells, 2])}else{
+    #    newsingDs[poscells] = apply(newsignDopts[poscells, ], 1, function(u) rbinom(1, u[1], u[2])) # !!! this is causing NA warnings
+    #  }
+    #}
+    # new section for debug
+    if (!exists("DEN_DEBUG", inherits = TRUE)) {
+      DEN_DEBUG <- new.env(parent = emptyenv())
+      DEN_DEBUG$bad_log <- NULL
+    }
+    DEN_DEBUG$calls <- 0L  # for counting calls
+    DEN_DEBUG$poscells_n <- integer()  # for counting calls
+    rb_safe <- function(size, prob){
+      if (!is.finite(size) || is.na(size) || size < 0 ||
+          !is.finite(prob) || is.na(prob) || prob < 0 || prob > 1) {
+        DEN_DEBUG$bad_log <- rbind(DEN_DEBUG$bad_log, data.frame(size=size, prob=prob))
+        return(0L)
+      }
+      rbinom(1, size, prob)
+    }
     if(sum(poscells) > 0){
-      if(sum(poscells) == 1){newsingDs[poscells] = rbinom(1, newsignDopts[poscells, 1], newsignDopts[poscells, 2])}else{
-        newsingDs[poscells] = apply(newsignDopts[poscells, ], 1, function(u) rbinom(1, u[1], u[2]))
+      if(sum(poscells) == 1){
+        newsingDs[poscells] <- rb_safe(newsignDopts[poscells, 1], newsignDopts[poscells, 2])
+        DEN_DEBUG$poscells_n <- c(DEN_DEBUG$poscells_n, sum(poscells))  # counting calls
+      } else {
+        newsingDs[poscells] <- apply(newsignDopts[poscells, ], 1, function(u) rb_safe(u[1], u[2]))
+        DEN_DEBUG$poscells_n <- c(DEN_DEBUG$poscells_n, sum(poscells)) # counting calls
       }
     }
+    # END
     newsingDs = matrix(newsingDs, nrow = nrow(sing_D), ncol = ncol(sing_D))
     sing_D = sing_D + newsingDs
 

@@ -12,18 +12,49 @@
 
 
 multinom <- function(x, type){
+
+  # DEBUG addition 24th Feb
+  if (!exists("DEN_MULTINOM_DEBUG", inherits = TRUE)) {
+    assign("DEN_MULTINOM_DEBUG", new.env(parent = emptyenv()), envir = .GlobalEnv)
+  }
+  DEN_MULTINOM_DEBUG <- get("DEN_MULTINOM_DEBUG", envir = .GlobalEnv)
+  if (is.null(DEN_MULTINOM_DEBUG$bad)) DEN_MULTINOM_DEBUG$bad <- NULL
+  rb_safe <- function(size, prob, ctx = NA_character_) {
+    # coerce
+    size <- suppressWarnings(as.numeric(size))
+    prob <- suppressWarnings(as.numeric(prob))
+
+    # detect bad inputs
+    bad <- (!is.finite(size) || is.na(size) || size < 0 ||
+              !is.finite(prob) || is.na(prob) || prob < 0 || prob > 1)
+
+    if (bad) {
+      DEN_MULTINOM_DEBUG$bad <- rbind(
+        DEN_MULTINOM_DEBUG$bad,
+        data.frame(size = size, prob = prob, ctx = ctx)
+      )
+      assign("DEN_MULTINOM_DEBUG", DEN_MULTINOM_DEBUG, envir = .GlobalEnv)
+      return(0L)  # safe during debugging
+    }
+
+    # rbinom expects integer-like size
+    rbinom(1, as.integer(round(size)), prob)
+  }
+  # END debug
+
+
   # mos mos_E in and out
   if(type == "mos_E"){
     # Infected mosquitoes
-    newmosE = apply(cbind(x[[1]][[1]], x[[1]][[2]]), 1, function(u) rbinom(1, u[1], u[2]))
-                    
-    for (i in 1:length(newmosE)){
-      newmosE[[i]] = ifelse(is.na(newmosE[[i]]), 0, newmosE[[i]]) }           
-                    
+    newmosE = apply(cbind(x[[1]][[1]], x[[1]][[2]]), 1, function(u) rb_safe(u[1], u[2], ctx = "mos_E:newmosE")) # rbinom(1, u[1], u[2]))
+
+    #for (i in 1:length(newmosE)){
+    #  newmosE[[i]] = ifelse(is.na(newmosE[[i]]), 0, newmosE[[i]]) } # commented out for rb_safe debug
+
     # order randomization of out compartments
     ord <- sample(1:3, 3)
     ord2 <- data.frame(name = c("EIP", "natdeath", "cdeath"), orignum = 1:3, newnum = ord)
-    
+
     mos_Es = x[[2]][[1]]
     for(k in 1:3){
       if(ord2[k, 3] == 1){newmosI <- EIP.MN.func(mos_Es, x[[2]][[2]]); mos_Es = mos_Es - newmosI}
@@ -34,13 +65,13 @@ multinom <- function(x, type){
     names(rtnlist) = c("newmosE", "newmosI", "newmosD", "newmosD2")
     return(rtnlist)
   }
-  
+
   # for mos_I out
   if(type == "mos_I"){
     # order randomization of out compartments
     ord <- sample(1:2, 2)
     ord2 <- data.frame(name = c("natdeath", "cdeath"), orignum = 1:2, newnum = ord)
-    
+
     mos_Is = matrix(x[[1]][[1]], nrow = 1)
     for(k in 1:2){
       if(ord2[k, 3] == 1){newmosD <- natdeath.MN.func(mos_Is, x[[1]][[2]]); mos_Is = mos_Is - newmosD}
@@ -50,7 +81,7 @@ multinom <- function(x, type){
     names(rtnlist) = c("newmosD", "newmosD2")
     return(rtnlist)
   }
-  
+
   # for sing_S in and out
   if(type == "sing_S"){
     # waning prophylactic drugs (not randomised)
@@ -62,11 +93,11 @@ multinom <- function(x, type){
         if(sum(humageAind) > 0){
           # required when just one patch matched
           if(length(humageA[humageAind, ]) == 2){mathumage = matrix(humageA[humageAind, ], nrow = 1)}else{(mathumage = humageA[humageAind, ])}
-          newhumS[k, ][ humageAind] = apply(mathumage, 1, function(u) rbinom(1, u[1], u[2]))
+          newhumS[k, ][ humageAind] = apply(mathumage, 1, function(u) rb_safe(u[1], u[2], ctx = "sing_S:waning")) #rbinom(1, u[1], u[2]))
         }
       }
     }
-    
+
     # order randomization of outcomponents
     ord <- sample(1:2, 2)
     ord2 <- data.frame(name = c("humInf", "humDrugtreat"), orignum = 1:2, newnum = ord)
@@ -74,22 +105,22 @@ multinom <- function(x, type){
     # if drugs are not in play, omit the sampling- quicker
     if(sum(x[[2]][[2]]) > 0){
       for(k in 1:2){
-        if(ord2[k, 3] == 1){newhumI <- apply(cbind(sing_Ss, x[[1]][[2]]), 1, function(u) rbinom(1, u[1], u[2])); 
-           for (i in 1:length(newhumI)){
-          newhumI[[i]] = ifelse(is.na(newhumI[[i]]), 0, newhumI[[i]])};
+        if(ord2[k, 3] == 1){newhumI <- apply(cbind(sing_Ss, x[[1]][[2]]), 1, function(u) rb_safe(u[1], u[2], ctx = "sing_S:newhumI")) #rbinom(1, u[1], u[2]));
+           #for (i in 1:length(newhumI)){ # commented out for rb_safe debug
+          #newhumI[[i]] = ifelse(is.na(newhumI[[i]]), 0, newhumI[[i]])};
             sing_Ss = sing_Ss - newhumI}
-        if(ord2[k, 3] == 2){newhumRt <- apply(cbind(sing_Ss, x[[2]][[2]]), 1, function(u) rbinom(1, u[1], u[2])); 
-           for (i in 1:length(newhumRt)){
-          newhumRt[[i]] = ifelse(is.na(newhumRt[[i]]), 0, newhumRt[[i]])};
-                                              sing_Ss = sing_Ss - newhumRt}
+        if(ord2[k, 3] == 2){newhumRt <- apply(cbind(sing_Ss, x[[2]][[2]]), 1, function(u) rb_safe(u[1], u[2], ctx = "sing_S:newhumRt")) #rb_safe(u[1], u[2], ctx = "sing_S:newhumRt")) #rbinom(1, u[1], u[2]));
+           #for (i in 1:length(newhumRt)){ # commented out for rb_safe debug
+          #newhumRt[[i]] = ifelse(is.na(newhumRt[[i]]), 0, newhumRt[[i]])};
+            sing_Ss = sing_Ss - newhumRt}
       }
-    }else{newhumI <- apply(cbind(x[[1]][[1]], x[[1]][[2]]), 1, function(u) rbinom(1, u[1], u[2]));
-           for (i in 1:length(newhumI)){
-          newhumI[[i]] = ifelse(is.na(newhumI[[i]]), 0, newhumI[[i]])};
-                           newhumRt = rep(0, length(x[[1]][[2]]))}
-    
+    } else{newhumI <- apply(cbind(x[[1]][[1]], x[[1]][[2]]), 1, function(u) rb_safe(u[1], u[2], ctx = "sing_S:newhumI_nodrugs")) #rbinom(1, u[1], u[2])); # !!! this is causing NA warnings / errors
+           #for (i in 1:length(newhumI)){ # commented out for rb_safe debug
+          #newhumI[[i]] = ifelse(is.na(newhumI[[i]]), 0, newhumI[[i]])};
+      newhumRt = rep(0, length(x[[1]][[2]]))}
+
     rtnlist  = list(newhumS, newhumI, newhumRt)
     names(rtnlist) = c("newhumS", "newhumI", "newhumRt")
     return(rtnlist)
-  }
+    }
 }

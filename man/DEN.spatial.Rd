@@ -4,13 +4,21 @@
 \alias{DEN.spatial}
 \title{Run a single realisation of the spatial dengue model}
 \usage{
-DEN.spatial(weekdates, fitdat, pastdat, sgpop, unipix, pixdistmat, steprun,
-  paramsList = NULL)
+DEN.spatial(
+  timestep,
+  fitdat,
+  pastdat,
+  sgpop,
+  unipix,
+  pixdistmat,
+  steprun,
+  paramsList = NULL
+)
 }
 \arguments{
-\item{weekdates}{Two element vector of the start and end weeks of the simulation over which the model will be evaluated over}
+\item{timestep}{Two-element vector of the first and last time steps of the case data (any resolution, e.g. weeks or months)}
 
-\item{fitdat}{Data frame of the locations, numbers and timings (in weeks) of cases to fit the model to, see ?sgdat}
+\item{fitdat}{Data frame of the locations, numbers and timings of cases to fit the model to, see ?sgdat. The column Week holds the time-step index at any temporal resolution (e.g. week or month); rows with Week == timestep[1] are used to seed initial infections.}
 
 \item{pastdat}{Data frame of the locations, numbers and timings (in weeks) of all cases in the dataset (is used to generate the starting immunity profile), see ?sgdat}
 
@@ -41,12 +49,12 @@ sgpop <- pop.process(sgpop, agg = 10)
 unipix <- make.unipix(sgpop)
 pixdistmat <- distm(cbind(unipix$x, unipix$y))
 sgdat <- data.frame(sgdat, patchID = apply(cbind(sgdat[, 3:2]), 1, pix.id.find, unipix))
-weekdates <- c(40, 92)
+timestep <- c(40, 92)
 # model run with default parameters
-denmod_sim <- DEN.spatial(weekdates, sgdat, sgdat, sgpop, unipix, pixdistmat, 365)
+denmod_sim <- DEN.spatial(timestep, sgdat, sgdat, sgpop, unipix, pixdistmat, 365)
 # model run with reactive drug deployment
 drugtreat = data.frame(EffCoverage = 0.9, Duration = 30, Radius = 1000, Delay = 0)
-denmod_sim_drugs <- DEN.spatial(weekdates, sgdat, unipix, pixdistmat, 365, paramsList = list(drugtreat = drugtreat))
+denmod_sim_drugs <- DEN.spatial(timestep, sgdat, unipix, pixdistmat, 365, paramsList = list(drugtreat = drugtreat))
 }
 \keyword{model}
 \keyword{simulation}
