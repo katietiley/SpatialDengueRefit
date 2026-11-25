@@ -1,12 +1,11 @@
-#' Posterior distribution of fitted model parameters
+#' Fitted model parameters
 #'
-#' A list of data.frames detailing the likelihood of each parameter value
-#' '
-#' @format A list of length four (each parameter), within each contains a data.frame composed of 10000 rows and 2 columns
-#' \describe{
-#'   \item{names}{parameter each posterior is related to}
-#'   \item{val}{value of the parameter at that sample}
-#'   \item{prob}{Likelihood of the data given the model with that parameter value}
-#'   }
+#' Parameter sets from the final round of ABC-SMC model fitting, from which
+#' DEN.spatial() samples one parameter set per simulation with probability
+#' proportional to totaldevs.
+#'
+#' @format A data.frame with one row per parameter set and columns hometime,
+#' mospdeath, betaEnv_mean, betaEnv_cor, Mov_model_type, pdetec, timedevs_R,
+#' spacedevs_R and totaldevs (sampling weight).
 #' @source {contact author for more detail on fitting}
 "finalWeights"
