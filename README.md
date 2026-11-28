@@ -59,7 +59,3 @@ The two analysis files support the manuscript:
 - Simulations run in parallel on 8 cores on Mac using `parallel::mclapply()`, which relies on forking. On Windows it runs on a single core; reduce the number of cores if memory is limited.
 ---
  
-## Licence
- 
-MIT.
- 
